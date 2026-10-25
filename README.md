@@ -11,7 +11,7 @@
 
 <p align="center">
   macOS · Windows · Linux<br>
-  <a href="https://github.com/harrisonwang/zipover-releases/releases/latest">Download</a> ·
+  <a href="https://zipover.app/download/">Download</a> ·
   <a href="README.CN.md">简体中文</a>
 </p>
 
@@ -19,7 +19,11 @@ Copy text, images, files, or folders on one computer and paste them on another. 
 
 The CLI and core are free and open source. Desktop is a separate commercial app: a one-time purchase covers one major version and five devices. An Internet connection is required only to activate or deactivate a device; activated devices can be used offline without periodic license checks.
 
+Desktop offers a **30-day offline trial** starting when you choose “开始 30 天免费试用” (Start 30-day free trial). No account or payment details are needed. When the trial ends, sync pauses and pairings remain. Purchases are not open yet.
+
 ## Install
+
+Download the **1.0 release candidate** from [zipover.app/download](https://zipover.app/download/). That page lists Mac Apple Silicon/Intel, Windows x64 and Linux x64 packages, installation instructions and current signing limitations. Stable 1.0.0 has not been published; the Desktop package-manager commands below become available after the stable release. The CLI installation commands further down are already available.
 
 ### macOS
 
@@ -48,11 +52,11 @@ The installer supports x86_64 Linux. On GNOME, enable an AppIndicator extension 
 
 ## Pair your computers
 
-1. Open Zipover on two computers connected to the same local network.
+1. Open Zipover on two computers connected to the same local network and start the free trial on each.
 2. Use the menu bar or tray icon to open the pairing window. Display a six-digit code on one computer and enter it on the other.
 3. Leave Zipover running on both computers, then copy and paste as usual.
 
-You only need to pair once. Add more computers the same way.
+You only need to pair once. With three or more computers, pair every two computers that need to exchange clipboard content directly. For example, computers A, B, and C need three pairings: A↔B, A↔C, and B↔C. Files and folders are not forwarded through an intermediate computer.
 
 ## Command line
 
