@@ -23,7 +23,7 @@ Desktop offers a **30-day offline trial** starting when you choose “开始 30 
 
 ## Install
 
-Download the **1.0 release candidate** from [zipover.app/download](https://zipover.app/download/). That page lists Mac Apple Silicon/Intel, Windows x64 and Linux x64 packages, installation instructions and current signing limitations. Stable 1.0.0 has not been published; the Desktop package-manager commands below become available after the stable release. The CLI installation commands further down are already available.
+Download **Zipover Desktop 1.0.0** from [zipover.app/download](https://zipover.app/download/). That page provides R2 downloads and GitHub mirrors for Mac Apple Silicon/Intel, Windows x64 and Linux x64, along with installation instructions and current signing limitations. You can also install Desktop using the package-manager commands below. The CLI is available separately.
 
 ### macOS
 
