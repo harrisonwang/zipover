@@ -1,0 +1,38 @@
+{
+  "version": "{{VERSION}}",
+  "description": "Sync clipboard and files across devices on a LAN",
+  "homepage": "https://github.com/{{REPO}}",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": [
+        "{{BASE_URL}}/{{TOOL}}_{{TAG}}_x86_64-pc-windows-msvc.exe#/zipover.exe",
+        "{{BASE_URL}}/LICENSE",
+        "{{BASE_URL}}/THIRD-PARTY-NOTICES_x86_64-pc-windows-msvc.txt"
+      ],
+      "hash": [
+        "{{SHA256:{{TOOL}}_{{TAG}}_x86_64-pc-windows-msvc.exe}}",
+        "{{SHA256:LICENSE}}",
+        "{{SHA256:THIRD-PARTY-NOTICES_x86_64-pc-windows-msvc.txt}}"
+      ]
+    }
+  },
+  "bin": "zipover.exe",
+  "checkver": {
+    "github": "https://github.com/{{REPO}}"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": [
+          "https://github.com/{{REPO}}/releases/download/v$version/{{TOOL}}_v$version_x86_64-pc-windows-msvc.exe#/zipover.exe",
+          "https://github.com/{{REPO}}/releases/download/v$version/LICENSE",
+          "https://github.com/{{REPO}}/releases/download/v$version/THIRD-PARTY-NOTICES_x86_64-pc-windows-msvc.txt"
+        ]
+      }
+    },
+    "hash": {
+      "url": "https://github.com/{{REPO}}/releases/download/v$version/SHA256SUMS.txt"
+    }
+  }
+}

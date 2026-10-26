@@ -1,0 +1,144 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Check package publishing credentials
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_APP_ID: ${{ vars.RELEASE_APP_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          for name in RELEASE_APP_ID RELEASE_APP_PRIVATE_KEY; do
+            test -n "${!name}" || { echo "::error::Missing release configuration: $name"; exit 1; }
+          done
+      - uses: actions/create-github-app-token@v2
+        if: github.ref_type == 'tag'
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: harrisonwang
+          repositories: |
+            homebrew-tap
+            scoop-bucket
+          permission-contents: write
+
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [prepare, ci]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Set version
+        shell: bash
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "zipover-cli") | .version')"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag does not match CLI version"
+            exit 1
+          fi
+          echo "VERSION=v$version" >> "$GITHUB_ENV"
+      - run: cargo build --locked --release -p zipover-cli --target "${{ matrix.target }}"
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p out package/zipover
+          python3 scripts/licenses.py "$TARGET" "out/THIRD-PARTY-NOTICES_${TARGET}.txt"
+          cp LICENSE out/LICENSE
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            cp "target/$TARGET/release/zipover.exe" "out/zipover_${VERSION}_${TARGET}.exe"
+            "out/zipover_${VERSION}_${TARGET}.exe" --version
+          else
+            cp "target/$TARGET/release/zipover" LICENSE "out/THIRD-PARTY-NOTICES_${TARGET}.txt" package/zipover/
+            tar -C package -czf "out/zipover_${VERSION}_${TARGET}.tar.gz" zipover
+            package/zipover/zipover --version
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          path: artifacts
+          merge-multiple: true
+      - name: Publish CLI
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/publish-cli.py
+      - uses: actions/create-github-app-token@v2
+        id: app
+        if: steps.publish.outputs.latest == 'true'
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: harrisonwang
+          repositories: |
+            homebrew-tap
+            scoop-bucket
+          permission-contents: write
+      - name: Update package repositories
+        if: steps.publish.outputs.latest == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        shell: bash
+        run: |
+          major="${GITHUB_REF_NAME#v}"
+          major="${major%%.*}"
+          for repository in homebrew-tap scoop-bucket; do
+            gh api --method POST "repos/harrisonwang/$repository/dispatches" \
+              -f event_type=tool-released \
+              -f 'client_payload[tool]=zipover' \
+              -f 'client_payload[component]=cli' \
+              -f 'client_payload[repo]=harrisonwang/zipover' \
+              -f "client_payload[tag]=$GITHUB_REF_NAME" \
+              -F "client_payload[major]=$major"
+          done

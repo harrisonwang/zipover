@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/zipover-core", "crates/zipover-cli"]
+resolver = "3"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+zipover-core = { path = "crates/zipover-core" }
+hex = "0.4"
+png = "0.17"
+
+[patch.crates-io]
+arboard = { git = "https://github.com/harrisonwang/arboard.git", rev = "3a8ac4af91254af3a5ac8abca6bb3fc0b43470ef" }
+
+[profile.release]
+lto = "thin"
+strip = true
