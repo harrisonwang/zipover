@@ -23,7 +23,7 @@ Desktop 提供 **30 天离线试用**，从点击「开始 30 天免费试用」
 
 ## 安装
 
-从 [zipover.app/cn/download](https://zipover.app/cn/download/) 下载 **Zipover Desktop 1.0.0**。页面提供 Mac Apple Silicon / Intel、Windows x64、Linux x64 的 R2 下载和 GitHub 备用下载，以及首次启动、签名限制说明。也可使用以下包管理器命令安装 Desktop；CLI 可按后文说明单独安装。
+从 [zipover.app/cn/download](https://zipover.app/cn/download/) 下载 **Zipover Desktop 1.0.0**。页面提供 Mac Apple Silicon / Intel、Windows x64、Linux x64 安装包及首次启动、签名限制说明。也可使用以下包管理器命令安装 Desktop；CLI 可按后文说明单独安装。
 
 ### macOS
 
