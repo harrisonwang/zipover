@@ -82,7 +82,7 @@ fn interface_address(listener: SocketAddr, ip: IpAddr, index: Option<u32>) -> Op
     if ip.is_unspecified()
         || ip.is_multicast()
         || ip.is_loopback()
-        || listener.is_ipv4() != ip.is_ipv4()
+        || (listener.is_ipv4() && ip.is_ipv6())
     {
         return None;
     }
@@ -130,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn advertised_addresses_use_actual_port_and_match_listener_family() {
+    fn advertised_addresses_match_the_listener_and_include_both_dual_stack_families() {
         let v4 = "0.0.0.0:52134".parse().unwrap();
         assert_eq!(
             interface_address(v4, "192.168.1.2".parse().unwrap(), Some(7)),
@@ -139,6 +139,10 @@ mod tests {
         assert!(interface_address(v4, "2001:db8::1".parse().unwrap(), Some(7)).is_none());
         assert!(interface_address(v4, "127.0.0.1".parse().unwrap(), Some(7)).is_none());
         let v6 = "[::]:52134".parse().unwrap();
+        assert_eq!(
+            interface_address(v6, "192.168.1.2".parse().unwrap(), Some(7)),
+            Some("192.168.1.2:52134".parse().unwrap())
+        );
         assert_eq!(
             interface_address(v6, "fe80::1".parse().unwrap(), Some(7)),
             Some("[fe80::1%7]:52134".parse().unwrap())

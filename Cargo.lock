@@ -1485,6 +1485,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "snow",
+ "socket2",
  "spake2",
 ]
 
