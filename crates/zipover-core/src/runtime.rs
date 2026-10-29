@@ -191,8 +191,7 @@ impl SyncRuntime {
     }
 
     pub fn wait(mut self) -> Result<()> {
-        let result = self
-            .clipboard_thread
+        self.clipboard_thread
             .take()
             .expect("同步运行时持有剪贴板线程")
             .join()
@@ -202,9 +201,7 @@ impl SyncRuntime {
                     "剪贴板同步线程异常退出",
                     "The clipboard sync thread stopped unexpectedly"
                 )
-            })?;
-        self.stop();
-        result
+            })?
     }
 }
 

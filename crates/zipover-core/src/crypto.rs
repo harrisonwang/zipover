@@ -14,11 +14,17 @@ const MAX_RECORD: usize = 65535;
 const TAG: usize = 16;
 const MAX_PAYLOAD: usize = MAX_RECORD - TAG;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionRole {
+    Initiator,
+    Responder,
+}
+
 // Never use a short code directly as a Noise PSK: a recorded handshake would
 // allow offline guessing. SPAKE2 derives a fresh strong key; Noise confirms it.
 pub(crate) fn pairing_key(
     stream: &mut TcpStream,
-    initiator: bool,
+    role: ConnectionRole,
     code: &str,
     context: &[u8],
 ) -> Result<PairingKey> {
@@ -26,10 +32,9 @@ pub(crate) fn pairing_key(
     let password = Password::new(code.as_bytes());
     let a = Identity::new(b"zipover numeric pairing v1");
     let b = Identity::new(context);
-    let (exchange, outbound) = if initiator {
-        Spake2::<Ed25519Group>::start_a(&password, &a, &b)
-    } else {
-        Spake2::<Ed25519Group>::start_b(&password, &a, &b)
+    let (exchange, outbound) = match role {
+        ConnectionRole::Initiator => Spake2::<Ed25519Group>::start_a(&password, &a, &b),
+        ConnectionRole::Responder => Spake2::<Ed25519Group>::start_b(&password, &a, &b),
     };
     stream.write_all(&outbound)?;
     let mut inbound = [0; 33];
@@ -50,17 +55,16 @@ pub(crate) struct Cipher {
 
 pub(crate) fn handshake(
     stream: &mut TcpStream,
-    initiator: bool,
+    role: ConnectionRole,
     key: &PairingKey,
     prologue: &[u8],
 ) -> Result<(Cipher, Cipher)> {
     let builder = Builder::new("Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s".parse()?)
         .psk(0, key)?
         .prologue(prologue)?;
-    let mut noise = if initiator {
-        builder.build_initiator()?
-    } else {
-        builder.build_responder()?
+    let mut noise = match role {
+        ConnectionRole::Initiator => builder.build_initiator()?,
+        ConnectionRole::Responder => builder.build_responder()?,
     };
     // NNpsk0 has exactly two handshake messages, e + tag (48 bytes) each.
     let mut message = [0; 48];
@@ -151,10 +155,22 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let client = thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
-            handshake(&mut stream, true, &[5; 32], b"zipover-test").unwrap()
+            handshake(
+                &mut stream,
+                ConnectionRole::Initiator,
+                &[5; 32],
+                b"zipover-test",
+            )
+            .unwrap()
         });
         let (mut stream, _) = listener.accept().unwrap();
-        let server = handshake(&mut stream, false, &[5; 32], b"zipover-test").unwrap();
+        let server = handshake(
+            &mut stream,
+            ConnectionRole::Responder,
+            &[5; 32],
+            b"zipover-test",
+        )
+        .unwrap();
         (client.join().unwrap(), server)
     }
 
@@ -196,10 +212,24 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let client = thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
-            handshake(&mut stream, true, &[5; 32], b"zipover-test").is_err()
+            handshake(
+                &mut stream,
+                ConnectionRole::Initiator,
+                &[5; 32],
+                b"zipover-test",
+            )
+            .is_err()
         });
         let (mut stream, _) = listener.accept().unwrap();
-        assert!(handshake(&mut stream, false, &[6; 32], b"zipover-test").is_err());
+        assert!(
+            handshake(
+                &mut stream,
+                ConnectionRole::Responder,
+                &[6; 32],
+                b"zipover-test"
+            )
+            .is_err()
+        );
         drop(stream);
         assert!(client.join().unwrap());
     }
@@ -213,10 +243,16 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let client = thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
-            pairing_key(&mut stream, true, code_a, b"devices A-B").unwrap()
+            pairing_key(
+                &mut stream,
+                ConnectionRole::Initiator,
+                code_a,
+                b"devices A-B",
+            )
+            .unwrap()
         });
         let (mut stream, _) = listener.accept().unwrap();
-        let key = pairing_key(&mut stream, false, code_b, context_b).unwrap();
+        let key = pairing_key(&mut stream, ConnectionRole::Responder, code_b, context_b).unwrap();
         (client.join().unwrap(), key)
     }
 

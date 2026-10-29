@@ -1,4 +1,5 @@
 use crate::config::{ConfigStore, DeviceId, PairingKey, TrustedPeer, random_bytes};
+use crate::crypto::ConnectionRole;
 use anyhow::{Context, Result, bail};
 use std::{
     net::SocketAddr,
@@ -199,12 +200,11 @@ impl Pairing {
         &mut self,
         peer: TrustedPeer,
         attempt: &PairAttempt,
-        joining: bool,
+        role: ConnectionRole,
     ) -> Result<()> {
-        let current = if joining {
-            self.request.as_ref().map(|r| &r.attempt)
-        } else {
-            self.invitation.as_ref().map(|i| &i.attempt)
+        let current = match role {
+            ConnectionRole::Initiator => self.request.as_ref().map(|r| &r.attempt),
+            ConnectionRole::Responder => self.invitation.as_ref().map(|i| &i.attempt),
         };
         if !current
             .is_some_and(|a| a.generation == attempt.generation && a.expires > Instant::now())
@@ -216,16 +216,15 @@ impl Pairing {
             )
         }
         self.store.trust(peer)?;
-        if joining {
-            self.request = None;
-        } else {
-            self.invitation = None;
+        match role {
+            ConnectionRole::Initiator => self.request = None,
+            ConnectionRole::Responder => self.invitation = None,
         }
         Ok(())
     }
 
-    pub(crate) fn failed(&mut self, attempt: &PairAttempt, joining: bool) {
-        if joining {
+    pub(crate) fn failed(&mut self, attempt: &PairAttempt, role: ConnectionRole) {
+        if role == ConnectionRole::Initiator {
             if self
                 .request
                 .as_ref()
@@ -377,8 +376,12 @@ mod tests {
         let mut a = a.lock().unwrap();
         a.invite().unwrap();
         let attempt = a.begin_incoming().unwrap();
-        a.accept(peer(), &attempt, false).unwrap();
-        assert!(a.accept(peer(), &attempt, false).is_err());
+        a.accept(peer(), &attempt, ConnectionRole::Responder)
+            .unwrap();
+        assert!(
+            a.accept(peer(), &attempt, ConnectionRole::Responder)
+                .is_err()
+        );
         assert!(a.begin_incoming().is_err());
         a.store.forget(peer().id).unwrap();
         assert!(a.key_for(peer().id).is_err());
@@ -391,16 +394,28 @@ mod tests {
         a.invite().unwrap();
         let attempt = a.begin_incoming().unwrap();
         a.cancel();
-        assert!(a.accept(peer(), &attempt, false).is_err());
+        assert!(
+            a.accept(peer(), &attempt, ConnectionRole::Responder)
+                .is_err()
+        );
         a.invite().unwrap();
-        assert!(a.accept(peer(), &attempt, false).is_err());
+        assert!(
+            a.accept(peer(), &attempt, ConnectionRole::Responder)
+                .is_err()
+        );
         let attempt = a.begin_incoming().unwrap();
         a.invitation.as_mut().unwrap().attempt.expires = Instant::now();
-        assert!(a.accept(peer(), &attempt, false).is_err());
+        assert!(
+            a.accept(peer(), &attempt, ConnectionRole::Responder)
+                .is_err()
+        );
         a.join("123456", None).unwrap();
         let attempt = a.request.as_ref().unwrap().attempt.clone();
         a.cancel();
-        assert!(a.accept(peer(), &attempt, true).is_err());
+        assert!(
+            a.accept(peer(), &attempt, ConnectionRole::Initiator)
+                .is_err()
+        );
     }
 
     #[test]
@@ -414,7 +429,7 @@ mod tests {
             .collect();
         assert!(a.begin_incoming().is_err());
         for attempt in attempts {
-            a.failed(&attempt, false);
+            a.failed(&attempt, ConnectionRole::Responder);
         }
         let invitation = a.invitation.as_ref().unwrap();
         assert_ne!(invitation.attempt.generation, old_generation);
@@ -503,7 +518,10 @@ mod tests {
         a.cancel();
         let mut remote = peer();
         remote.addresses = vec![endpoint];
-        assert!(a.accept(remote, &attempt, true).is_err());
+        assert!(
+            a.accept(remote, &attempt, ConnectionRole::Initiator)
+                .is_err()
+        );
         assert!(a.store.config.peers.is_empty());
         a.join_at("123456", endpoint).unwrap();
         a.request.as_mut().unwrap().discovery_deadline = Instant::now();

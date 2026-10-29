@@ -329,13 +329,7 @@ fn send_file_transfer_inner(
                 break;
             }
 
-            let length_u64 = u64::try_from(length).context(crate::i18n::text(
-                "文件分块大小溢出",
-                "File chunk size overflow",
-            ))?;
-            let next_offset = offset
-                .checked_add(length_u64)
-                .context(crate::i18n::text("文件大小溢出", "File size overflow"))?;
+            let next_offset = offset + length as u64;
             if next_offset > local.entry.size {
                 crate::i18n::localized!(
                     bail,
@@ -628,17 +622,7 @@ impl IncomingTransfer {
                 offset
             )
         }
-        let length = u64::try_from(bytes.len()).context(crate::i18n::text(
-            "文件分块大小溢出",
-            "File chunk size overflow",
-        ))?;
-        let next_size = file
-            .received_size
-            .checked_add(length)
-            .context(crate::i18n::text(
-                "接收文件大小溢出",
-                "Received file size overflow",
-            ))?;
+        let next_size = file.received_size + bytes.len() as u64;
         if next_size > file.expected_size {
             crate::i18n::localized!(
                 bail,
@@ -770,8 +754,8 @@ impl IncomingTransfer {
         self.committed = true;
         Ok(FinishedTransfer {
             fingerprint: local_fingerprint,
-            roots: self.roots.clone(),
-            directory: self.directory.clone(),
+            roots: std::mem::take(&mut self.roots),
+            directory: std::mem::take(&mut self.directory),
         })
     }
 
@@ -864,9 +848,6 @@ pub(crate) fn safe_relative_path(path: &[u8]) -> Result<PathBuf> {
         }
     }
     push_safe_component(&mut component, &mut result, path)?;
-    if result.as_os_str().is_empty() {
-        crate::i18n::localized!(bail, "传输路径为空", "The transfer path is empty")
-    }
     Ok(result)
 }
 
