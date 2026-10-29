@@ -1478,6 +1478,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hostname",
+ "if-addrs",
  "mdns-sd",
  "png 0.17.16",
  "serde",

@@ -39,6 +39,7 @@ struct Invitation {
 pub(crate) struct PairRequest {
     pub attempt: PairAttempt,
     pub device: Option<String>,
+    pub endpoint: Option<SocketAddr>,
     pub started: bool,
     discovery_deadline: Instant,
 }
@@ -116,7 +117,7 @@ impl Pairing {
 
     pub fn join_progress(&self) -> Option<JoinProgress> {
         self.request.as_ref().map(|request| {
-            if request.started {
+            if request.started || request.endpoint.is_some() {
                 JoinProgress::Connecting
             } else {
                 JoinProgress::Discovering
@@ -125,6 +126,20 @@ impl Pairing {
     }
 
     pub fn join(&mut self, code: &str, device: Option<String>) -> Result<()> {
+        self.request_pairing(code, device, None)
+    }
+
+    pub fn join_at(&mut self, code: &str, endpoint: SocketAddr) -> Result<()> {
+        crate::address::validate_pairing_address(endpoint)?;
+        self.request_pairing(code, None, Some(endpoint))
+    }
+
+    fn request_pairing(
+        &mut self,
+        code: &str,
+        device: Option<String>,
+        endpoint: Option<SocketAddr>,
+    ) -> Result<()> {
         let code = parse_code(code)?;
         let attempt = PairAttempt {
             generation: random_bytes()?,
@@ -135,6 +150,7 @@ impl Pairing {
         self.request = Some(PairRequest {
             attempt,
             device,
+            endpoint,
             started: false,
             discovery_deadline: Instant::now() + DISCOVERY_TIMEOUT,
         });
@@ -268,8 +284,16 @@ impl Pairing {
             .as_ref()
             .is_some_and(|r| !r.started && r.discovery_deadline <= now)
         {
+            let manual = self
+                .request
+                .as_ref()
+                .is_some_and(|request| request.endpoint.is_some());
             self.request = None;
-            self.error = Some(crate::i18n::text("未找到待配对设备，请确认对方正显示配对码且处于同一局域网", "No device found. Make sure the other computer shows its pairing code and is on the same local network.").into());
+            self.error = Some(if manual {
+                crate::i18n::text("无法连接设备，请核对 IP 地址、端口和配对码后重试", "Unable to connect. Check the IP address, port and pairing code, then try again.")
+            } else {
+                crate::i18n::text("未找到待配对设备，请确认对方正显示配对码且处于同一局域网", "No device found. Make sure the other computer shows its pairing code and is on the same local network.")
+            }.into());
         } else if self
             .request
             .as_ref()
@@ -321,6 +345,7 @@ mod tests {
         TrustedPeer {
             id: [9; 16],
             key: [7; 32],
+            addresses: Vec::new(),
             name: "test".into(),
         }
     }
@@ -465,5 +490,31 @@ mod tests {
         a.expire();
         assert_eq!(a.join_progress(), Some(JoinProgress::Connecting));
         assert!(a.error.is_none());
+    }
+
+    #[test]
+    fn manual_pairing_connects_immediately_and_cancellation_cannot_save_an_endpoint() {
+        let a = pairing();
+        let mut a = a.lock().unwrap();
+        let endpoint = "127.0.0.1:52134".parse().unwrap();
+        a.join_at("123456", endpoint).unwrap();
+        assert_eq!(a.join_progress(), Some(JoinProgress::Connecting));
+        let attempt = a.request.as_ref().unwrap().attempt.clone();
+        a.cancel();
+        let mut remote = peer();
+        remote.addresses = vec![endpoint];
+        assert!(a.accept(remote, &attempt, true).is_err());
+        assert!(a.store.config.peers.is_empty());
+        a.join_at("123456", endpoint).unwrap();
+        a.request.as_mut().unwrap().discovery_deadline = Instant::now();
+        a.expire();
+        assert!(a.request.is_none());
+        assert!(
+            a.error
+                .as_deref()
+                .unwrap()
+                .starts_with(crate::i18n::text("无法连接设备", "Unable to connect."))
+        );
+        assert!(a.store.config.peers.is_empty());
     }
 }

@@ -173,6 +173,13 @@ fn wait_for_pairing(runtime: &SyncRuntime) -> Result<()> {
                 "{heading}：{code}\n在另一台设备运行：zipover --pair {code}",
                 "{heading}: {code}\nOn the other computer, run: zipover --pair {code}"
             );
+            for address in &state.pairing_addresses {
+                localized!(
+                    println,
+                    "若未自动发现，可运行：zipover --pair {code} --connect {address}",
+                    "If discovery is unavailable, run: zipover --pair {code} --connect {address}"
+                );
+            }
             if shown_code.is_none() {
                 localized!(
                     eprintln,

@@ -32,6 +32,7 @@ pub struct DeviceInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
     pub listen_addr: Option<SocketAddr>,
+    pub pairing_addresses: Vec<SocketAddr>,
     pub devices: Vec<DeviceInfo>,
     pub nearby: Vec<DeviceInfo>,
     pub code: Option<String>,
@@ -59,7 +60,17 @@ impl SyncRuntime {
         let listener = start_listener(&mut store, options.listen)?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
-        let discovery = Discovery::start(&store.config, local_addr)?;
+        let discovery = match Discovery::start(&store.config, local_addr) {
+            Ok(discovery) => Some(discovery),
+            Err(error) => {
+                crate::i18n::localized!(
+                    eprintln,
+                    "自动发现不可用，仍可通过 IP 地址配对或连接已保存的设备：{error:#}",
+                    "Device discovery is unavailable; pair by IP address or connect to saved devices: {error:#}"
+                );
+                None
+            }
+        };
         let pairing = Pairing::new(store);
         let hub = PeerHub::default();
         let (tx, rx) = mpsc::sync_channel(32);
@@ -120,6 +131,7 @@ impl SyncRuntime {
         nearby.sort_by_key(|peer| peer.id);
         Snapshot {
             listen_addr: Some(self.local_addr),
+            pairing_addresses: crate::address::pairing_addresses(self.local_addr),
             devices,
             nearby,
             code: pairing.invitation_code().map(str::to_owned),
@@ -139,6 +151,13 @@ impl SyncRuntime {
             .lock()
             .expect("配对状态锁已损坏")
             .join(code, device)
+    }
+
+    pub fn join_at(&self, code: &str, endpoint: SocketAddr) -> Result<()> {
+        self.pairing
+            .lock()
+            .expect("配对状态锁已损坏")
+            .join_at(code, endpoint)
     }
 
     pub fn cancel_pairing(&self) {

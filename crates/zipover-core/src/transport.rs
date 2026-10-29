@@ -242,7 +242,7 @@ const PREFACE_LEN: usize = 38;
 
 pub(crate) fn network_loop(
     listener: TcpListener,
-    mut discovery: Discovery,
+    mut discovery: Option<Discovery>,
     hub: PeerHub,
     shared: SharedPairing,
     incoming: SyncSender<IncomingEvent>,
@@ -251,7 +251,9 @@ pub(crate) fn network_loop(
     let mut jobs: Vec<(DeviceId, thread::JoinHandle<()>)> = Vec::new();
     let mut next_connect = Instant::now();
     while !hub.is_shutdown() {
-        discovery.poll(&shared);
+        if let Some(discovery) = &mut discovery {
+            discovery.poll(&shared);
+        }
         {
             let mut pairing = shared.lock().expect("配对状态锁已损坏");
             pairing.expire();
@@ -290,15 +292,26 @@ pub(crate) fn network_loop(
             let mut pairing = shared.lock().expect("配对状态锁已损坏");
             let local_id = pairing.store.config.id;
             let mut targets: Vec<(DeviceId, ConnectionAuth, PeerAddresses)> = Vec::new();
-            for peer in &pairing.discovered {
-                if local_id < peer.id
-                    && let Some(trusted) =
-                        pairing.store.config.peers.iter().find(|p| p.id == peer.id)
+            for trusted in &pairing.store.config.peers {
+                let mut addresses = Vec::new();
+                if (local_id < trusted.id || !trusted.addresses.is_empty())
+                    && let Some(peer) = pairing.discovered.iter().find(|peer| peer.id == trusted.id)
                 {
+                    addresses.extend_from_slice(&peer.addresses);
+                }
+                for address in &trusted.addresses {
+                    if !addresses.contains(address) {
+                        addresses.push(*address);
+                    }
+                }
+                addresses
+                    .retain(|address| crate::address::validate_pairing_address(*address).is_ok());
+                addresses.dedup();
+                if !addresses.is_empty() {
                     targets.push((
-                        peer.id,
+                        trusted.id,
                         ConnectionAuth::Trusted(trusted.key),
-                        PeerAddresses::Discovered(peer.addresses.clone()),
+                        PeerAddresses::Discovered(addresses),
                     ));
                 }
             }
@@ -317,7 +330,9 @@ pub(crate) fn network_loop(
                     .collect();
                 let already_connected = candidates.iter().any(|peer| active.contains(&peer.id));
                 candidates.retain(|peer| !active.contains(&peer.id));
-                let target = if let Some(address) = &options.connect {
+                let target = if let Some(address) = request.endpoint {
+                    Some(([0; 16], PeerAddresses::Discovered(vec![address])))
+                } else if let Some(address) = &options.connect {
                     Some(([0; 16], PeerAddresses::Explicit(address.clone())))
                 } else if candidates.len() == 1 {
                     Some((
@@ -382,9 +397,22 @@ pub(crate) fn network_loop(
                 jobs.push((
                     id,
                     thread::spawn(move || {
-                        let result = connect_addresses(addresses).and_then(|stream| {
-                            establish(stream, Some((id, auth.clone())), &hub, &shared, &incoming)
-                        });
+                        let result = match &auth {
+                            ConnectionAuth::Trusted(key) => connect_trusted_addresses(
+                                addresses, id, *key, &hub, &shared, &incoming,
+                            ),
+                            ConnectionAuth::Pair(_) => {
+                                connect_addresses(addresses).and_then(|stream| {
+                                    establish(
+                                        stream,
+                                        Some((id, auth.clone())),
+                                        &hub,
+                                        &shared,
+                                        &incoming,
+                                    )
+                                })
+                            }
+                        };
                         if let Err(error) = result {
                             crate::i18n::localized!(
                                 eprintln,
@@ -415,22 +443,70 @@ enum PeerAddresses {
     Explicit(String),
 }
 
-fn connect_addresses(addresses: PeerAddresses) -> Result<TcpStream> {
-    let addresses = match addresses {
+#[cfg(test)]
+#[path = "transport/manual_tests.rs"]
+mod manual_tests;
+
+fn resolve_addresses(addresses: PeerAddresses) -> Result<Vec<SocketAddr>> {
+    Ok(match addresses {
         PeerAddresses::Discovered(addresses) => addresses,
-        PeerAddresses::Explicit(address) => address
-            .to_socket_addrs()
-            .with_context(|| {
-                crate::i18n::localized!(
-                    format,
-                    "解析设备地址 {address} 失败",
-                    "Unable to resolve device address {address}"
-                )
-            })?
-            .collect(),
-    };
+        PeerAddresses::Explicit(address) => match crate::parse_pairing_address(&address) {
+            Ok(address) => vec![address],
+            Err(_) => address
+                .to_socket_addrs()
+                .with_context(|| {
+                    crate::i18n::localized!(
+                        format,
+                        "解析设备地址 {address} 失败",
+                        "Unable to resolve device address {address}"
+                    )
+                })?
+                .collect(),
+        },
+    })
+}
+
+fn connect_trusted_addresses(
+    addresses: PeerAddresses,
+    id: DeviceId,
+    key: PairingKey,
+    hub: &PeerHub,
+    shared: &SharedPairing,
+    incoming: &SyncSender<IncomingEvent>,
+) -> Result<()> {
     let mut last_error = None;
-    for address in addresses {
+    for address in resolve_addresses(addresses)? {
+        if hub.is_shutdown() {
+            break;
+        }
+        let result = TcpStream::connect_timeout(&address, Duration::from_secs(1))
+            .map_err(anyhow::Error::from)
+            .and_then(|stream| {
+                establish(
+                    stream,
+                    Some((id, ConnectionAuth::Trusted(key))),
+                    hub,
+                    shared,
+                    incoming,
+                )
+            });
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        crate::i18n::localized!(
+            anyhow,
+            "没有可用的设备地址",
+            "No device addresses are available"
+        )
+    }))
+}
+
+fn connect_addresses(addresses: PeerAddresses) -> Result<TcpStream> {
+    let mut last_error = None;
+    for address in resolve_addresses(addresses)? {
         match TcpStream::connect_timeout(&address, Duration::from_secs(1)) {
             Ok(stream) => return Ok(stream),
             Err(error) => last_error = Some(error),
@@ -554,6 +630,13 @@ fn establish(
                 id,
                 key,
                 name: remote_name.clone(),
+                // Only outbound targets are listening endpoints. The incoming
+                // TCP source port belongs to a temporary client socket.
+                addresses: if initiator {
+                    vec![stream.peer_addr()?]
+                } else {
+                    Vec::new()
+                },
             };
             if initiator {
                 if reader.read_frame(&mut stream)? != b"paired" {
