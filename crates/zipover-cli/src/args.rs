@@ -74,9 +74,9 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command>
                 match arg.to_str() {
                     Some("-h" | "--help") => return Ok(Command::Help),
                     Some("--listen") => {
-                        options.listen = next_text(&mut args, "--listen")?.parse().context(
+                        options.listen = Some(next_text(&mut args, "--listen")?.parse().context(
                             zipover_core::i18n::text("监听地址无效", "Invalid listen address"),
-                        )?
+                        )?)
                     }
                     Some("--connect") => options.connect = Some(next_text(&mut args, "--connect")?),
                     Some("--tray") => tray = true,
@@ -180,6 +180,25 @@ mod tests {
         assert!(parse_str(&["--pair"]).is_err());
         assert!(parse_str(&["--device", "hp"]).is_err());
         assert!(parse_str(&["--tray", "--pair", "001234"]).is_err());
+    }
+
+    #[test]
+    fn listen_overrides_remain_distinct_from_automatic_port_selection() {
+        for tray in [false, true] {
+            let mut args = Vec::new();
+            if tray {
+                args.push("--tray");
+            }
+            let Command::Run { options, .. } = parse_str(&args).unwrap() else {
+                panic!()
+            };
+            assert_eq!(options.listen, None);
+            args.extend(["--listen", "127.0.0.1:0"]);
+            let Command::Run { options, .. } = parse_str(&args).unwrap() else {
+                panic!()
+            };
+            assert_eq!(options.listen, Some("127.0.0.1:0".parse().unwrap()));
+        }
     }
     #[test]
     fn copy_preserves_paths() {

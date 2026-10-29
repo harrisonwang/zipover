@@ -153,3 +153,22 @@ impl Drop for Discovery {
         let _ = self.daemon.shutdown();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn service_advertises_the_actual_listener_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let config = DeviceConfig {
+            id: [1; 16],
+            name: "test".into(),
+            peers: Vec::new(),
+            listen_port: None,
+        };
+        let service = Discovery::service(&config, listener.local_addr().unwrap(), false).unwrap();
+        assert_eq!(service.get_port(), listener.local_addr().unwrap().port());
+    }
+}

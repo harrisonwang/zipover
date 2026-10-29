@@ -53,7 +53,9 @@ fn run() -> Result<()> {
         } => {
             if tray {
                 let mut command = desktop_command()?;
-                command.arg("--listen").arg(options.listen.to_string());
+                if let Some(address) = options.listen {
+                    command.arg("--listen").arg(address.to_string());
+                }
                 if let Some(address) = options.connect {
                     command.arg("--connect").arg(address);
                 }
@@ -128,6 +130,12 @@ fn desktop_command() -> Result<std::process::Command> {
 
 fn sync(options: SyncOptions, code: Option<String>, device: Option<String>) -> Result<()> {
     let runtime = SyncRuntime::start(options)?;
+    localized!(
+        eprintln,
+        "监听地址：{}",
+        "Listening on {}",
+        runtime.local_addr()
+    );
     if let Some(code) = code {
         runtime.join(&code, device)?;
         localized!(eprintln, "正在配对…", "Pairing…");

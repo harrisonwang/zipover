@@ -19,12 +19,12 @@ fn lan_round_trip() {
     let role = env::var("ZIPOVER_TEST_ROLE").expect("ZIPOVER_TEST_ROLE");
     let other = if role == "mac" { "hp" } else { "mac" };
     let options = SyncOptions {
-        listen: SocketAddr::from(([0, 0, 0, 0], 45919)),
+        listen: Some(SocketAddr::from(([0, 0, 0, 0], 45919))),
         connect: env::var("ZIPOVER_TEST_CONNECT").ok(),
     };
     let store = ConfigStore::load().unwrap();
     assert!(store.config.peers.is_empty());
-    let listener = TcpListener::bind(options.listen).unwrap();
+    let listener = TcpListener::bind(options.listen.unwrap()).unwrap();
     listener.set_nonblocking(true).unwrap();
     let discovery = Discovery::start(&store.config, listener.local_addr().unwrap()).unwrap();
     let pairing = Pairing::new(store);
