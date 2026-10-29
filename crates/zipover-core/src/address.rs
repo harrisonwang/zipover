@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 
-const DEFAULT_PORT: u16 = 45876;
+const DEFAULT_PORT: u16 = 57321;
 
 /// Parse a manually entered IP address, optionally followed by a listening port.
 pub fn parse_pairing_address(value: &str) -> Result<SocketAddr> {
@@ -101,13 +101,13 @@ mod tests {
     #[test]
     fn manual_addresses_support_both_ip_families_and_optional_ports() {
         for (value, expected) in [
-            (" 192.168.1.9 ", "192.168.1.9:45876"),
+            (" 192.168.1.9 ", "192.168.1.9:57321"),
             ("192.168.1.9:52134", "192.168.1.9:52134"),
-            ("2001:db8::1", "[2001:db8::1]:45876"),
+            ("2001:db8::1", "[2001:db8::1]:57321"),
             ("[2001:db8::1]:52134", "[2001:db8::1]:52134"),
-            ("fe80::1%7", "[fe80::1%7]:45876"),
+            ("fe80::1%7", "[fe80::1%7]:57321"),
             ("[fe80::1%7]:52134", "[fe80::1%7]:52134"),
-            ("127.0.0.1", "127.0.0.1:45876"),
+            ("127.0.0.1", "127.0.0.1:57321"),
         ] {
             assert_eq!(
                 parse_pairing_address(value).unwrap(),
@@ -116,12 +116,12 @@ mod tests {
         }
         for value in [
             "",
-            "hp.local:45876",
+            "hp.local:57321",
             "192.168.1.999",
-            "0.0.0.0:45876",
-            "[::]:45876",
-            "224.0.0.1:45876",
-            "[ff02::1]:45876",
+            "0.0.0.0:57321",
+            "[::]:57321",
+            "224.0.0.1:57321",
+            "[ff02::1]:57321",
             "192.168.1.2:0",
             "192.168.1.2:65536",
         ] {
