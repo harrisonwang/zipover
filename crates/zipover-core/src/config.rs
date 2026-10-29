@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     env,
@@ -28,10 +28,20 @@ impl DeviceConfig {
     fn read(path: &Path) -> Result<Option<Self>> {
         match fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("读取设备配置失败：{}", path.display()))
+                .with_context(|| {
+                    crate::i18n::localized!(
+                        format,
+                        "读取设备配置失败：{}",
+                        "Unable to read device settings: {}",
+                        path.display()
+                    )
+                })
                 .map(Some),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).context("读取设备配置失败"),
+            Err(error) => Err(error).context(crate::i18n::text(
+                "读取设备配置失败",
+                "Unable to read device settings",
+            )),
         }
     }
 
@@ -54,15 +64,20 @@ impl ConfigStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self> {
-        fs::create_dir_all(path.parent().context("配置目录无效")?)?;
+        fs::create_dir_all(path.parent().context(crate::i18n::text(
+            "配置目录无效",
+            "Invalid settings directory",
+        ))?)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path.with_extension("lock"))?;
-        lock.try_lock()
-            .context("已有 Zipover 使用此配置，请先退出该进程")?;
+        lock.try_lock().context(crate::i18n::text(
+            "已有 Zipover 使用此配置，请先退出该进程",
+            "Zipover is already using these settings. Quit the other process first.",
+        ))?;
         let config = match DeviceConfig::read(&path)? {
             Some(config) => config,
             None => DeviceConfig {
@@ -82,7 +97,11 @@ impl ConfigStore {
 
     pub fn trust(&mut self, peer: TrustedPeer) -> Result<()> {
         if peer.id == self.config.id {
-            bail!("不能与本机配对")
+            crate::i18n::localized!(
+                bail,
+                "不能与本机配对",
+                "You cannot pair this computer with itself"
+            )
         }
         let mut next = self.config.clone();
         next.peers.retain(|saved| saved.id != peer.id);
@@ -101,7 +120,10 @@ impl ConfigStore {
     }
 
     fn save(&self, config: &DeviceConfig) -> Result<()> {
-        let parent = self.path.parent().context("配置目录无效")?;
+        let parent = self.path.parent().context(crate::i18n::text(
+            "配置目录无效",
+            "Invalid settings directory",
+        ))?;
         fs::create_dir_all(parent)?;
         let temporary = self.path.with_extension("tmp");
         let mut options = OpenOptions::new();
@@ -115,13 +137,22 @@ impl ConfigStore {
         file.write_all(&serde_json::to_vec_pretty(config)?)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(temporary, &self.path).context("保存设备配置失败")
+        fs::rename(temporary, &self.path).context(crate::i18n::text(
+            "保存设备配置失败",
+            "Unable to save device settings",
+        ))
     }
 }
 
 pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     let mut bytes = [0; N];
-    getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("生成随机密钥失败：{error}"))?;
+    getrandom::fill(&mut bytes).map_err(|error| {
+        crate::i18n::localized!(
+            anyhow,
+            "生成随机密钥失败：{error}",
+            "Unable to generate a random key: {error}"
+        )
+    })?;
     Ok(bytes)
 }
 
@@ -139,7 +170,12 @@ fn config_dir() -> Result<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|path| PathBuf::from(path).join(".config")));
-    Ok(base.context("无法确定用户配置目录")?.join("zipover"))
+    Ok(base
+        .context(crate::i18n::text(
+            "无法确定用户配置目录",
+            "Unable to locate the user settings directory",
+        ))?
+        .join("zipover"))
 }
 
 #[cfg(test)]

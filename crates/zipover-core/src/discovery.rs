@@ -74,13 +74,17 @@ impl Discovery {
                     Ok(()) => {
                         self.inviting = inviting;
                     }
-                    Err(error) => eprintln!("自动发现：{error}"),
+                    Err(error) => crate::i18n::localized!(
+                        eprintln,
+                        "自动发现：{error}",
+                        "Device discovery: {error}"
+                    ),
                 }
             }
         }
         for event in self.monitor.try_iter() {
             if let DaemonEvent::Error(error) = event {
-                eprintln!("自动发现：{error}");
+                crate::i18n::localized!(eprintln, "自动发现：{error}", "Device discovery: {error}");
             }
         }
         for event in self.receiver.try_iter() {
@@ -122,7 +126,13 @@ impl Discovery {
                         inviting: info.get_property_val_str("pairing") == Some("digits-v1"),
                     };
                     if !pairing.discovered.iter().any(|old| old == &peer) {
-                        eprintln!("自动发现：{} {:?}", peer.name, peer.addresses);
+                        crate::i18n::localized!(
+                            eprintln,
+                            "自动发现：{} {:?}",
+                            "Device discovery: {} {:?}",
+                            peer.name,
+                            peer.addresses
+                        );
                     }
                     pairing.discovered.retain(|old| old.id != id);
                     pairing.discovered.push(peer);
