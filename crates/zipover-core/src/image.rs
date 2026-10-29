@@ -30,7 +30,6 @@ pub(crate) struct IncomingImage {
     width: u32,
     height: u32,
     expected_size: u64,
-    received_size: u64,
     bytes: Vec<u8>,
     hasher: Sha256,
 }
@@ -97,7 +96,6 @@ pub(crate) fn send_image_transfer(
     hub: &PeerHub,
     peers: &[u64],
     id: &str,
-    fingerprint: u64,
     image: &CapturedImage,
 ) -> Result<()> {
     let result = (|| {
@@ -115,7 +113,7 @@ pub(crate) fn send_image_transfer(
             peers,
             &WireMessage::ImageStart {
                 id: id.to_string(),
-                fingerprint,
+                fingerprint: image.fingerprint,
                 width: image.width,
                 height: image.height,
                 size,
@@ -132,12 +130,7 @@ pub(crate) fn send_image_transfer(
                     bytes: chunk.to_vec(),
                 },
             )?;
-            offset = offset
-                .checked_add(u64::try_from(chunk.len()).context(crate::i18n::text(
-                    "图片分块大小溢出",
-                    "Image chunk size overflow",
-                ))?)
-                .context(crate::i18n::text("图片偏移量溢出", "Image offset overflow"))?;
+            offset += chunk.len() as u64;
         }
         let sha256: [u8; 32] = Sha256::digest(image.bytes.as_ref()).into();
         hub.send_to_targets(
@@ -185,7 +178,6 @@ impl IncomingImage {
             width,
             height,
             expected_size,
-            received_size: 0,
             bytes: Vec::with_capacity(capacity),
             hasher: Sha256::new(),
         })
@@ -195,23 +187,14 @@ impl IncomingImage {
         if bytes.is_empty() || bytes.len() > CHUNK_SIZE {
             crate::i18n::localized!(bail, "图片分块大小无效", "Invalid image chunk size")
         }
-        if offset != self.received_size {
+        if offset != self.bytes.len() as u64 {
             crate::i18n::localized!(
                 bail,
                 "图片分块偏移量不连续",
                 "Nonsequential image chunk offset"
             )
         }
-        let next = self
-            .received_size
-            .checked_add(u64::try_from(bytes.len()).context(crate::i18n::text(
-                "图片分块大小溢出",
-                "Image chunk size overflow",
-            ))?)
-            .context(crate::i18n::text(
-                "图片接收大小溢出",
-                "Received image size overflow",
-            ))?;
+        let next = self.bytes.len() as u64 + bytes.len() as u64;
         if next > self.expected_size {
             crate::i18n::localized!(
                 bail,
@@ -221,18 +204,17 @@ impl IncomingImage {
         }
         self.bytes.extend_from_slice(bytes);
         self.hasher.update(bytes);
-        self.received_size = next;
         Ok(())
     }
 
     pub(crate) fn finish(self, expected_sha256: [u8; 32]) -> Result<(u64, ClipboardPayload)> {
-        if self.received_size != self.expected_size {
+        if self.bytes.len() as u64 != self.expected_size {
             crate::i18n::localized!(
                 bail,
                 "图片大小不匹配：期望 {}，实际 {}",
                 "Image size mismatch: expected {}, received {}",
                 format_bytes(self.expected_size),
-                format_bytes(self.received_size)
+                format_bytes(self.bytes.len() as u64)
             )
         }
         let actual_sha256: [u8; 32] = self.hasher.finalize().into();

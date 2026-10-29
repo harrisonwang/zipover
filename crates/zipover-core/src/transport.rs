@@ -1,6 +1,6 @@
 use crate::config::{DeviceId, PairingKey, TrustedPeer};
 use crate::{
-    crypto,
+    crypto::{self, ConnectionRole},
     discovery::Discovery,
     pairing::{PairAttempt, SharedPairing},
     protocol::{FRAME_LIMIT, WireMessage},
@@ -306,7 +306,6 @@ pub(crate) fn network_loop(
                 }
                 addresses
                     .retain(|address| crate::address::validate_pairing_address(*address).is_ok());
-                addresses.dedup();
                 if !addresses.is_empty() {
                     targets.push((
                         trusted.id,
@@ -315,9 +314,9 @@ pub(crate) fn network_loop(
                     ));
                 }
             }
-            if pairing.request.as_ref().is_some_and(|r| !r.started) {
-                let request = pairing.request.as_ref().unwrap();
-                let mut candidates: Vec<_> = pairing
+            let state = &mut *pairing;
+            if let Some(request) = state.request.as_mut().filter(|r| !r.started) {
+                let mut candidates: Vec<_> = state
                     .discovered
                     .iter()
                     .filter(|p| {
@@ -343,7 +342,6 @@ pub(crate) fn network_loop(
                     None
                 };
                 if let Some((id, addresses)) = target {
-                    let request = pairing.request.as_mut().unwrap();
                     if jobs.len() < MAX_PEERS && !jobs.iter().any(|(pending, _)| *pending == id) {
                         request.started = true;
                         targets.retain(|(other, ..)| *other != id);
@@ -353,8 +351,8 @@ pub(crate) fn network_loop(
                         );
                     }
                 } else if candidates.len() > 1 {
-                    pairing.request = None;
-                    pairing.error = Some(
+                    state.request = None;
+                    state.error = Some(
                         crate::i18n::text(
                             "发现多台待配对设备，请选择设备后重试",
                             "Multiple devices are ready to pair. Select a device and try again.",
@@ -362,8 +360,8 @@ pub(crate) fn network_loop(
                         .into(),
                     );
                 } else if already_connected {
-                    pairing.request = None;
-                    pairing.error = Some(
+                    state.request = None;
+                    state.error = Some(
                         crate::i18n::text(
                             "此设备已连接，无需重复配对",
                             "This device is already connected. Pairing again is not needed.",
@@ -371,11 +369,11 @@ pub(crate) fn network_loop(
                         .into(),
                     );
                 }
-            } else if pairing.request.is_none()
+            } else if state.request.is_none()
                 && let Some(address) = &options.connect
-                && pairing.store.config.peers.len() == 1
+                && state.store.config.peers.len() == 1
             {
-                let peer = &pairing.store.config.peers[0];
+                let peer = &state.store.config.peers[0];
                 targets.retain(|(other, ..)| *other != peer.id);
                 targets.push((
                     peer.id,
@@ -424,7 +422,7 @@ pub(crate) fn network_loop(
                                 shared
                                     .lock()
                                     .expect("配对状态锁已损坏")
-                                    .failed(attempt, true);
+                                    .failed(attempt, ConnectionRole::Initiator);
                             }
                         }
                     }),
@@ -542,9 +540,8 @@ fn establish(
         let pairing = shared.lock().expect("配对状态锁已损坏");
         (pairing.store.config.id, pairing.store.config.name.clone())
     };
-    let initiator = target.is_some();
     let mut preface = [0; PREFACE_LEN];
-    let (mut id, auth) = if let Some((id, auth)) = target {
+    let (role, mut id, auth) = if let Some((id, auth)) = target {
         preface[..5].copy_from_slice(MAGIC);
         preface[5..21].copy_from_slice(&local_id);
         preface[21..37].copy_from_slice(&id);
@@ -555,7 +552,7 @@ fn establish(
             0
         };
         stream.write_all(&preface)?;
-        (id, auth)
+        (ConnectionRole::Initiator, id, auth)
     } else {
         stream.read_exact(&mut preface)?;
         let pairing_mode = preface[37] == 2;
@@ -576,7 +573,7 @@ fn establish(
         } else {
             ConnectionAuth::Trusted(pairing.key_for(id)?)
         };
-        (id, auth)
+        (ConnectionRole::Responder, id, auth)
     };
     let result = (|| -> Result<()> {
         if id == local_id {
@@ -593,7 +590,7 @@ fn establish(
                 // Return the responder ID for the explicit-address fallback; bind it
                 // into both PAKE and Noise even when the caller did not know it.
                 let mut responder = local_id;
-                if initiator {
+                if role == ConnectionRole::Initiator {
                     stream.read_exact(&mut responder)?;
                     if id != [0; 16] && id != responder {
                         crate::i18n::localized!(
@@ -614,10 +611,10 @@ fn establish(
                     stream.write_all(&responder)?;
                 }
                 context.extend_from_slice(&responder);
-                crypto::pairing_key(&mut stream, initiator, &attempt.code, &context)?
+                crypto::pairing_key(&mut stream, role, &attempt.code, &context)?
             }
         };
-        let (mut writer, mut reader) = crypto::handshake(&mut stream, initiator, &key, &context)?;
+        let (mut writer, mut reader) = crypto::handshake(&mut stream, role, &key, &context)?;
         writer.write_frame(&mut stream, local_name.as_bytes())?;
         let remote_name = String::from_utf8(reader.read_frame(&mut stream)?).context(
             crate::i18n::text("设备名不是 UTF-8", "The device name is not valid UTF-8"),
@@ -632,13 +629,13 @@ fn establish(
                 name: remote_name.clone(),
                 // Only outbound targets are listening endpoints. The incoming
                 // TCP source port belongs to a temporary client socket.
-                addresses: if initiator {
+                addresses: if role == ConnectionRole::Initiator {
                     vec![stream.peer_addr()?]
                 } else {
                     Vec::new()
                 },
             };
-            if initiator {
+            if role == ConnectionRole::Initiator {
                 if reader.read_frame(&mut stream)? != b"paired" {
                     crate::i18n::localized!(
                         bail,
@@ -649,13 +646,13 @@ fn establish(
                 shared
                     .lock()
                     .expect("配对状态锁已损坏")
-                    .accept(peer, attempt, true)?;
+                    .accept(peer, attempt, role)?;
                 writer.write_frame(&mut stream, b"paired")?;
             } else {
                 shared
                     .lock()
                     .expect("配对状态锁已损坏")
-                    .accept(peer, attempt, false)?;
+                    .accept(peer, attempt, role)?;
                 writer.write_frame(&mut stream, b"paired")?;
                 if reader.read_frame(&mut stream)? != b"paired" {
                     crate::i18n::localized!(
@@ -700,7 +697,7 @@ fn establish(
         shared
             .lock()
             .expect("配对状态锁已损坏")
-            .failed(attempt, initiator);
+            .failed(attempt, role);
     }
     result
 }

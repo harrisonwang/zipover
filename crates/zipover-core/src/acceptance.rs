@@ -106,7 +106,7 @@ fn lan_round_trip() {
                 &capture_files(std::slice::from_ref(&folder))?,
             )?;
             let image = image::test_image();
-            send_image_transfer(&hub, &peers, "image", image.fingerprint(), &image)?;
+            send_image_transfer(&hub, &peers, "image", &image)?;
             let mut files = None;
             let mut image = None;
             let (mut got_text, mut got_files, mut got_image, mut got_ack, mut sent_ack) =

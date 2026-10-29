@@ -42,25 +42,17 @@ impl Discovery {
             ("protocol", version.as_str()),
             ("pairing", if inviting { "digits-v1" } else { "" }),
         ];
+        let ip = (!address.ip().is_unspecified()).then_some(address.ip());
         let mut service = ServiceInfo::new(
             SERVICE_TYPE,
             &id,
             &format!("zipover-{id}.local."),
-            (),
+            ip.as_slice(),
             address.port(),
             &properties[..],
         )?;
-        if address.ip().is_unspecified() {
+        if ip.is_none() {
             service = service.enable_addr_auto();
-        } else {
-            service = ServiceInfo::new(
-                SERVICE_TYPE,
-                &id,
-                &format!("zipover-{id}.local."),
-                address.ip(),
-                address.port(),
-                &properties[..],
-            )?;
         }
         service.set_interfaces(vec![if address.is_ipv4() {
             IfKind::IPv4

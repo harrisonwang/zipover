@@ -1,11 +1,14 @@
-#[cfg(test)]
-use crate::files::{self, TransferEntry, capture_files};
 use crate::{
     clipboard::{CaptureCache, CapturedPayload, apply_payload, capture_payload, set_file_list},
     files::{IncomingTransfer, files_summary, send_file_transfer},
     image::{IncomingImage, send_image_transfer},
-    protocol::*,
+    protocol::{ClipboardPayload, WireMessage},
     transport::{IncomingEvent, PeerHub},
+};
+#[cfg(test)]
+use crate::{
+    files::{self, TransferEntry, capture_files},
+    protocol::CHUNK_SIZE,
 };
 use anyhow::{Result, anyhow};
 use arboard::Clipboard;
@@ -112,18 +115,14 @@ pub(crate) fn clipboard_loop(
             }
             expire_sessions(&mut state);
 
-            if outgoing.as_ref().is_some_and(|job| job.is_finished()) {
-                let result = outgoing
-                    .take()
-                    .expect("发送任务已完成")
-                    .join()
-                    .unwrap_or_else(|_| {
-                        Err(crate::i18n::localized!(
-                            anyhow,
-                            "剪贴板发送线程异常退出",
-                            "The clipboard sending thread stopped unexpectedly"
-                        ))
-                    });
+            if let Some(job) = outgoing.take_if(|job| job.is_finished()) {
+                let result = job.join().unwrap_or_else(|_| {
+                    Err(crate::i18n::localized!(
+                        anyhow,
+                        "剪贴板发送线程异常退出",
+                        "The clipboard sending thread stopped unexpectedly"
+                    ))
+                });
                 match result {
                     Ok(()) => state.last_send_error = None,
                     Err(error) => {
@@ -206,9 +205,7 @@ fn send_payload(hub: &PeerHub, peers: &[u64], id: &str, payload: CapturedPayload
                 payload: ClipboardPayload::Text(text),
             },
         ),
-        CapturedPayload::Image(image) => {
-            send_image_transfer(hub, peers, id, image.fingerprint(), &image)
-        }
+        CapturedPayload::Image(image) => send_image_transfer(hub, peers, id, &image),
         CapturedPayload::Files(files) => {
             if files.internal {
                 crate::i18n::localized!(
@@ -267,9 +264,7 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
                 return;
             }
             let key = SessionKey::new(peer_id, id.clone());
-            if state.active_transfers.contains_key(&key) {
-                state.active_transfers.remove(&key);
-            }
+            state.active_transfers.remove(&key);
             if state.active_transfers.len() >= MAX_ACTIVE_TRANSFERS {
                 crate::i18n::localized!(
                     eprintln,
