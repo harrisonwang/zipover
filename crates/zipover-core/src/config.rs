@@ -22,6 +22,8 @@ pub(crate) struct DeviceConfig {
     pub id: DeviceId,
     pub name: String,
     pub peers: Vec<TrustedPeer>,
+    #[serde(default)]
+    pub listen_port: Option<u16>,
 }
 
 impl DeviceConfig {
@@ -84,6 +86,7 @@ impl ConfigStore {
                 id: random_bytes()?,
                 name: hostname::get()?.to_string_lossy().into_owned(),
                 peers: Vec::new(),
+                listen_port: None,
             },
         };
         let store = Self {
@@ -106,6 +109,20 @@ impl ConfigStore {
         let mut next = self.config.clone();
         next.peers.retain(|saved| saved.id != peer.id);
         next.peers.push(peer);
+        self.save(&next)?;
+        self.config = next;
+        Ok(())
+    }
+
+    pub fn remember_listen_port(&mut self, port: u16) -> Result<()> {
+        if port == 0 {
+            crate::i18n::localized!(bail, "监听端口无效", "Invalid listening port");
+        }
+        if self.config.listen_port == Some(port) {
+            return Ok(());
+        }
+        let mut next = self.config.clone();
+        next.listen_port = Some(port);
         self.save(&next)?;
         self.config = next;
         Ok(())
@@ -215,5 +232,17 @@ mod tests {
         drop(store);
         assert!(DeviceConfig::read(&path).unwrap().unwrap().peers.is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_device_settings_do_not_require_a_saved_listening_port() {
+        let id = [0; 16];
+        let value = serde_json::json!({
+            "id": id,
+            "name": "legacy",
+            "peers": []
+        });
+        let config: DeviceConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.listen_port, None);
     }
 }
