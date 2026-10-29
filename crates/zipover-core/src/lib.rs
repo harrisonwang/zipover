@@ -1,3 +1,4 @@
+mod address;
 mod clipboard;
 mod config;
 mod crypto;
@@ -11,6 +12,7 @@ mod runtime;
 mod sync;
 mod transport;
 
+pub use address::parse_pairing_address;
 pub use clipboard::copy_paths;
 pub use config::DeviceId;
 pub use pairing::JoinProgress;

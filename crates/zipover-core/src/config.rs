@@ -4,6 +4,7 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::Write,
+    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
@@ -15,6 +16,8 @@ pub(crate) struct TrustedPeer {
     pub id: DeviceId,
     pub name: String,
     pub key: PairingKey,
+    #[serde(default)]
+    pub addresses: Vec<SocketAddr>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -98,7 +101,7 @@ impl ConfigStore {
         Ok(store)
     }
 
-    pub fn trust(&mut self, peer: TrustedPeer) -> Result<()> {
+    pub fn trust(&mut self, mut peer: TrustedPeer) -> Result<()> {
         if peer.id == self.config.id {
             crate::i18n::localized!(
                 bail,
@@ -107,6 +110,11 @@ impl ConfigStore {
             )
         }
         let mut next = self.config.clone();
+        if let Some(saved) = next.peers.iter().find(|saved| saved.id == peer.id) {
+            peer.addresses.extend_from_slice(&saved.addresses);
+        }
+        peer.addresses.sort_unstable();
+        peer.addresses.dedup();
         next.peers.retain(|saved| saved.id != peer.id);
         next.peers.push(peer);
         self.save(&next)?;
@@ -212,6 +220,7 @@ mod tests {
             id: [1; 16],
             name: "test".into(),
             key: [2; 32],
+            addresses: vec!["127.0.0.1:45876".parse().unwrap()],
         };
         store.trust(peer).unwrap();
         assert!(ConfigStore::open(path.clone()).is_err());
@@ -228,6 +237,10 @@ mod tests {
         let mut store = ConfigStore::open(path.clone()).unwrap();
         assert_eq!(store.config.id, id);
         assert_eq!(store.config.peers[0].key, [2; 32]);
+        assert_eq!(
+            store.config.peers[0].addresses,
+            vec!["127.0.0.1:45876".parse::<SocketAddr>().unwrap()]
+        );
         store.forget([1; 16]).unwrap();
         drop(store);
         assert!(DeviceConfig::read(&path).unwrap().unwrap().peers.is_empty());
@@ -237,12 +250,15 @@ mod tests {
     #[test]
     fn old_device_settings_do_not_require_a_saved_listening_port() {
         let id = [0; 16];
+        let peer_id = [1; 16];
+        let key = [2; 32];
         let value = serde_json::json!({
             "id": id,
             "name": "legacy",
-            "peers": []
+            "peers": [{"id":peer_id,"name":"old peer","key":key}]
         });
         let config: DeviceConfig = serde_json::from_value(value).unwrap();
         assert_eq!(config.listen_port, None);
+        assert!(config.peers[0].addresses.is_empty());
     }
 }

@@ -33,7 +33,7 @@ fn lan_round_trip() {
     let worker = {
         let hub = hub.clone();
         let pairing = pairing.clone();
-        thread::spawn(move || network_loop(listener, discovery, hub, pairing, tx, options))
+        thread::spawn(move || network_loop(listener, Some(discovery), hub, pairing, tx, options))
     };
     let root = env::temp_dir().join(format!("zipover-lan-{}-{}", role, timestamp_nanos()));
     let folder = root.join("目录 with spaces");

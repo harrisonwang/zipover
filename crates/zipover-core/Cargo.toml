@@ -11,6 +11,7 @@ bincode = "1"
 getrandom = "0.3"
 hex.workspace = true
 hostname = "0.4"
+if-addrs = "0.15"
 mdns-sd = { version = "0.21", default-features = false }
 png.workspace = true
 serde = { version = "1", features = ["derive"] }
