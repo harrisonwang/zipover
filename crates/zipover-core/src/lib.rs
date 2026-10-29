@@ -3,6 +3,7 @@ mod config;
 mod crypto;
 mod discovery;
 mod files;
+pub mod i18n;
 mod image;
 mod pairing;
 mod protocol;

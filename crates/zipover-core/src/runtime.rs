@@ -57,9 +57,17 @@ pub struct SyncRuntime {
 impl SyncRuntime {
     pub fn start(options: SyncOptions) -> Result<Self> {
         let store = ConfigStore::load()?;
-        let clipboard = Clipboard::new().context("访问系统剪贴板失败")?;
+        let clipboard = Clipboard::new().context(crate::i18n::text(
+            "访问系统剪贴板失败",
+            "Unable to access the system clipboard",
+        ))?;
         let listener = TcpListener::bind(options.listen).with_context(|| {
-            format!("监听 {} 失败（是否已有 Zipover 在运行？）", options.listen)
+            crate::i18n::localized!(
+                format,
+                "监听 {} 失败（是否已有 Zipover 在运行？）",
+                "Unable to listen on {} (is Zipover already running?)",
+                options.listen
+            )
         })?;
         listener.set_nonblocking(true)?;
         let discovery = Discovery::start(&store.config, listener.local_addr()?)?;
@@ -159,7 +167,13 @@ impl SyncRuntime {
             .take()
             .expect("同步运行时持有剪贴板线程")
             .join()
-            .map_err(|_| anyhow!("剪贴板同步线程异常退出"))?;
+            .map_err(|_| {
+                crate::i18n::localized!(
+                    anyhow,
+                    "剪贴板同步线程异常退出",
+                    "The clipboard sync thread stopped unexpectedly"
+                )
+            })?;
         self.stop();
         result
     }

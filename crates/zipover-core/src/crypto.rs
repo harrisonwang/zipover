@@ -2,7 +2,7 @@
 //! TCP records use implicit increasing nonces; replay, reordering, and tampering fail closed.
 use crate::config::PairingKey;
 use crate::protocol::FRAME_LIMIT;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use snow::{Builder, StatelessTransportState};
 use std::{
     io::{Read, Write},
@@ -36,9 +36,11 @@ pub(crate) fn pairing_key(
     stream.read_exact(&mut inbound)?;
     exchange
         .finish(&inbound)
-        .map_err(|_| anyhow::anyhow!("配对交换无效"))?
+        .map_err(|_| crate::i18n::localized!(anyhow, "配对交换无效", "Invalid pairing exchange"))?
         .try_into()
-        .map_err(|_| anyhow::anyhow!("配对密钥长度无效"))
+        .map_err(|_| {
+            crate::i18n::localized!(anyhow, "配对密钥长度无效", "Invalid pairing key length")
+        })
 }
 
 pub(crate) struct Cipher {
@@ -70,7 +72,7 @@ pub(crate) fn handshake(
             stream.read_exact(&mut message)?;
             noise
                 .read_message(&message, &mut [])
-                .context("认证失败：配对码不匹配或连接被篡改")?;
+                .context(crate::i18n::text("认证失败：配对码不匹配或连接被篡改", "Authentication failed: the pairing code does not match or the connection was tampered with"))?;
         }
     }
     let state = Arc::new(noise.into_stateless_transport_mode()?);
@@ -86,7 +88,7 @@ pub(crate) fn handshake(
 impl Cipher {
     pub fn write_frame(&mut self, stream: &mut impl Write, frame: &[u8]) -> Result<()> {
         if frame.is_empty() || frame.len() > FRAME_LIMIT {
-            bail!("发送帧大小无效")
+            crate::i18n::localized!(bail, "发送帧大小无效", "Invalid outgoing frame size")
         }
         self.write_record(stream, &(frame.len() as u32).to_be_bytes())?;
         for chunk in frame.chunks(MAX_PAYLOAD) {
@@ -99,7 +101,7 @@ impl Cipher {
         let length = self.read_record(stream, 4)?;
         let length = u32::from_be_bytes(length.try_into().expect("已读取四字节长度")) as usize;
         if length == 0 || length > FRAME_LIMIT {
-            bail!("接收帧大小无效")
+            crate::i18n::localized!(bail, "接收帧大小无效", "Invalid incoming frame size")
         }
         let mut frame = Vec::with_capacity(length);
         while frame.len() < length {
@@ -122,13 +124,19 @@ impl Cipher {
         let mut data = vec![0; length];
         self.state
             .read_message(self.nonce, &encrypted, &mut data)
-            .context("消息认证失败（密文损坏、重放或顺序错误）")?;
+            .context(crate::i18n::text(
+                "消息认证失败（密文损坏、重放或顺序错误）",
+                "Message authentication failed (damaged ciphertext, replay, or incorrect order)",
+            ))?;
         self.advance()?;
         Ok(data)
     }
 
     fn advance(&mut self) -> Result<()> {
-        self.nonce = self.nonce.checked_add(1).context("会话 nonce 已用尽")?;
+        self.nonce = self.nonce.checked_add(1).context(crate::i18n::text(
+            "会话 nonce 已用尽",
+            "The session nonce is exhausted",
+        ))?;
         Ok(())
     }
 }
