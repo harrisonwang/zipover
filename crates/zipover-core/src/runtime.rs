@@ -9,17 +9,24 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use arboard::Clipboard;
 use std::{
-    io,
     net::{SocketAddr, TcpListener},
     sync::mpsc,
     thread,
 };
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOptions {
-    /// None selects a saved or available port; explicit addresses bind strictly.
-    pub listen: Option<SocketAddr>,
+    pub listen: SocketAddr,
     pub connect: Option<String>,
+}
+
+impl Default for SyncOptions {
+    fn default() -> Self {
+        Self {
+            listen: ([0, 0, 0, 0], 57321).into(),
+            connect: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,12 +59,18 @@ pub struct SyncRuntime {
 
 impl SyncRuntime {
     pub fn start(options: SyncOptions) -> Result<Self> {
-        let mut store = ConfigStore::load()?;
+        let store = ConfigStore::load()?;
         let clipboard = Clipboard::new().context(crate::i18n::text(
             "访问系统剪贴板失败",
             "Unable to access the system clipboard",
         ))?;
-        let listener = start_listener(&mut store, options.listen)?;
+        let listener = TcpListener::bind(options.listen).with_context(|| {
+            crate::i18n::localized!(format,
+                "监听 {} 失败，请退出其他 Zipover 进程或使用 --listen 选择地址",
+                "Unable to listen on {}. Quit the other Zipover process or choose an address with --listen",
+                options.listen
+            )
+        })?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
         let discovery = match Discovery::start(&store.config, local_addr) {
@@ -193,49 +206,6 @@ impl SyncRuntime {
     }
 }
 
-fn bind_listener(requested: Option<SocketAddr>, preferred: SocketAddr) -> io::Result<TcpListener> {
-    if let Some(address) = requested {
-        return TcpListener::bind(address);
-    }
-    match TcpListener::bind(preferred) {
-        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-            TcpListener::bind(SocketAddr::new(preferred.ip(), 0))
-        }
-        result => result,
-    }
-}
-
-fn start_listener(store: &mut ConfigStore, requested: Option<SocketAddr>) -> Result<TcpListener> {
-    let preferred = SocketAddr::from((
-        [0, 0, 0, 0],
-        store
-            .config
-            .listen_port
-            .filter(|port| *port != 0)
-            .unwrap_or(45876),
-    ));
-    let listener = bind_listener(requested, preferred).with_context(|| {
-        if let Some(address) = requested {
-            crate::i18n::localized!(
-                format,
-                "监听 {address} 失败。请用 --listen 选择其他地址，或省略 --listen 自动选择可用端口",
-                "Unable to listen on {address}. Choose another address with --listen, or omit --listen to select an available port automatically"
-            )
-        } else {
-            crate::i18n::localized!(
-                format,
-                "无法在 {} 上选择可用的监听端口",
-                "Unable to select an available listening port on {}",
-                preferred.ip()
-            )
-        }
-    })?;
-    if requested.is_none() {
-        store.remember_listen_port(listener.local_addr()?.port())?;
-    }
-    Ok(listener)
-}
-
 impl Drop for SyncRuntime {
     fn drop(&mut self) {
         self.stop();
@@ -261,84 +231,4 @@ pub fn paired_devices() -> Result<Vec<DeviceInfo>> {
 
 pub fn forget_device(id: DeviceId) -> Result<()> {
     ConfigStore::load()?.forget(id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{fs, net::UdpSocket};
-
-    #[test]
-    fn automatic_listening_recovers_from_tcp_conflicts_but_explicit_listening_does_not() {
-        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
-        let preferred = occupied.local_addr().unwrap();
-        let automatic = bind_listener(None, preferred).unwrap();
-        let actual = automatic.local_addr().unwrap();
-        assert_eq!(actual.ip(), preferred.ip());
-        assert_ne!(actual.port(), preferred.port());
-        assert_ne!(actual.port(), 0);
-        assert_eq!(
-            bind_listener(Some(preferred), preferred)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AddrInUse
-        );
-        let explicit = bind_listener(Some("127.0.0.1:0".parse().unwrap()), preferred).unwrap();
-        assert_ne!(explicit.local_addr().unwrap().port(), 0);
-    }
-
-    #[test]
-    fn udp_occupation_does_not_trigger_tcp_fallback() {
-        let (tcp, udp) = (0..32)
-            .find_map(|_| {
-                let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
-                UdpSocket::bind(tcp.local_addr().unwrap())
-                    .ok()
-                    .map(|udp| (tcp, udp))
-            })
-            .expect("a port available for both TCP and UDP");
-        let preferred = udp.local_addr().unwrap();
-        drop(tcp);
-        let listener = bind_listener(None, preferred).unwrap();
-        assert_eq!(listener.local_addr().unwrap(), preferred);
-    }
-
-    #[test]
-    fn automatic_listening_does_not_hide_invalid_local_addresses() {
-        let unavailable = "192.0.2.1:45876".parse().unwrap();
-        let error = bind_listener(None, unavailable).unwrap_err();
-        assert_ne!(error.kind(), io::ErrorKind::AddrInUse);
-    }
-
-    #[test]
-    fn automatic_port_survives_restart_and_explicit_overrides_leave_it_unchanged() {
-        let root = std::env::temp_dir().join(format!(
-            "zipover-listen-{}",
-            hex::encode(crate::config::random_bytes::<16>().unwrap())
-        ));
-        let path = root.join("devices.json");
-        let mut store = ConfigStore::open(path.clone()).unwrap();
-        let occupied = TcpListener::bind("0.0.0.0:0").unwrap();
-        let preferred = occupied.local_addr().unwrap();
-        store.remember_listen_port(preferred.port()).unwrap();
-        let automatic = start_listener(&mut store, None).unwrap();
-        let actual = automatic.local_addr().unwrap();
-        assert_ne!(actual.port(), preferred.port());
-        assert_eq!(store.config.listen_port, Some(actual.port()));
-        let explicit = start_listener(&mut store, Some("127.0.0.1:0".parse().unwrap())).unwrap();
-        assert_ne!(explicit.local_addr().unwrap().port(), actual.port());
-        assert_eq!(store.config.listen_port, Some(actual.port()));
-        let error = start_listener(&mut store, Some(preferred)).unwrap_err();
-        assert!(error.to_string().contains("--listen"));
-        assert_eq!(store.config.listen_port, Some(actual.port()));
-        drop(explicit);
-        drop(automatic);
-        drop(store);
-        let mut store = ConfigStore::open(path).unwrap();
-        let listener = start_listener(&mut store, None).unwrap();
-        assert_eq!(listener.local_addr().unwrap(), actual);
-        drop(listener);
-        drop(store);
-        fs::remove_dir_all(root).unwrap();
-    }
 }

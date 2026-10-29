@@ -166,7 +166,6 @@ mod tests {
             id: [1; 16],
             name: "test".into(),
             peers: Vec::new(),
-            listen_port: None,
         };
         let service = Discovery::service(&config, listener.local_addr().unwrap(), false).unwrap();
         assert_eq!(service.get_port(), listener.local_addr().unwrap().port());

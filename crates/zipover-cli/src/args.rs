@@ -74,9 +74,9 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command>
                 match arg.to_str() {
                     Some("-h" | "--help") => return Ok(Command::Help),
                     Some("--listen") => {
-                        options.listen = Some(next_text(&mut args, "--listen")?.parse().context(
+                        options.listen = next_text(&mut args, "--listen")?.parse().context(
                             zipover_core::i18n::text("监听地址无效", "Invalid listen address"),
-                        )?)
+                        )?
                     }
                     Some("--connect") => options.connect = Some(next_text(&mut args, "--connect")?),
                     Some("--tray") => tray = true,
@@ -168,7 +168,7 @@ mod tests {
             "--device",
             "hp",
             "--connect",
-            "hp.local:45876",
+            "hp.local:57321",
         ])
         .unwrap()
         else {
@@ -176,14 +176,14 @@ mod tests {
         };
         assert_eq!(code.as_deref(), Some("001234"));
         assert_eq!(device.as_deref(), Some("hp"));
-        assert_eq!(options.connect.as_deref(), Some("hp.local:45876"));
+        assert_eq!(options.connect.as_deref(), Some("hp.local:57321"));
         assert!(parse_str(&["--pair"]).is_err());
         assert!(parse_str(&["--device", "hp"]).is_err());
         assert!(parse_str(&["--tray", "--pair", "001234"]).is_err());
     }
 
     #[test]
-    fn listen_overrides_remain_distinct_from_automatic_port_selection() {
+    fn listen_defaults_and_explicit_overrides_are_preserved() {
         for tray in [false, true] {
             let mut args = Vec::new();
             if tray {
@@ -192,12 +192,12 @@ mod tests {
             let Command::Run { options, .. } = parse_str(&args).unwrap() else {
                 panic!()
             };
-            assert_eq!(options.listen, None);
+            assert_eq!(options.listen, "0.0.0.0:57321".parse().unwrap());
             args.extend(["--listen", "127.0.0.1:0"]);
             let Command::Run { options, .. } = parse_str(&args).unwrap() else {
                 panic!()
             };
-            assert_eq!(options.listen, Some("127.0.0.1:0".parse().unwrap()));
+            assert_eq!(options.listen, "127.0.0.1:0".parse().unwrap());
         }
     }
     #[test]

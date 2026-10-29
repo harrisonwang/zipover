@@ -25,8 +25,6 @@ pub(crate) struct DeviceConfig {
     pub id: DeviceId,
     pub name: String,
     pub peers: Vec<TrustedPeer>,
-    #[serde(default)]
-    pub listen_port: Option<u16>,
 }
 
 impl DeviceConfig {
@@ -89,7 +87,6 @@ impl ConfigStore {
                 id: random_bytes()?,
                 name: hostname::get()?.to_string_lossy().into_owned(),
                 peers: Vec::new(),
-                listen_port: None,
             },
         };
         let store = Self {
@@ -117,20 +114,6 @@ impl ConfigStore {
         peer.addresses.dedup();
         next.peers.retain(|saved| saved.id != peer.id);
         next.peers.push(peer);
-        self.save(&next)?;
-        self.config = next;
-        Ok(())
-    }
-
-    pub fn remember_listen_port(&mut self, port: u16) -> Result<()> {
-        if port == 0 {
-            crate::i18n::localized!(bail, "监听端口无效", "Invalid listening port");
-        }
-        if self.config.listen_port == Some(port) {
-            return Ok(());
-        }
-        let mut next = self.config.clone();
-        next.listen_port = Some(port);
         self.save(&next)?;
         self.config = next;
         Ok(())
@@ -220,7 +203,7 @@ mod tests {
             id: [1; 16],
             name: "test".into(),
             key: [2; 32],
-            addresses: vec!["127.0.0.1:45876".parse().unwrap()],
+            addresses: vec!["127.0.0.1:57321".parse().unwrap()],
         };
         store.trust(peer).unwrap();
         assert!(ConfigStore::open(path.clone()).is_err());
@@ -239,7 +222,7 @@ mod tests {
         assert_eq!(store.config.peers[0].key, [2; 32]);
         assert_eq!(
             store.config.peers[0].addresses,
-            vec!["127.0.0.1:45876".parse::<SocketAddr>().unwrap()]
+            vec!["127.0.0.1:57321".parse::<SocketAddr>().unwrap()]
         );
         store.forget([1; 16]).unwrap();
         drop(store);
@@ -248,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn old_device_settings_do_not_require_a_saved_listening_port() {
+    fn old_device_settings_do_not_require_saved_peer_addresses() {
         let id = [0; 16];
         let peer_id = [1; 16];
         let key = [2; 32];
@@ -258,7 +241,6 @@ mod tests {
             "peers": [{"id":peer_id,"name":"old peer","key":key}]
         });
         let config: DeviceConfig = serde_json::from_value(value).unwrap();
-        assert_eq!(config.listen_port, None);
         assert!(config.peers[0].addresses.is_empty());
     }
 }

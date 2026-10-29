@@ -53,9 +53,7 @@ fn run() -> Result<()> {
         } => {
             if tray {
                 let mut command = desktop_command()?;
-                if let Some(address) = options.listen {
-                    command.arg("--listen").arg(address.to_string());
-                }
+                command.arg("--listen").arg(options.listen.to_string());
                 if let Some(address) = options.connect {
                     command.arg("--connect").arg(address);
                 }

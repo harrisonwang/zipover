@@ -16,11 +16,10 @@ struct Node {
 
 impl Node {
     fn start(path: &Path, address: Option<SocketAddr>, connect: Option<String>) -> Self {
-        let mut store = ConfigStore::open(path.to_owned()).unwrap();
+        let store = ConfigStore::open(path.to_owned()).unwrap();
         let listener =
             TcpListener::bind(address.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap())).unwrap();
         let address = listener.local_addr().unwrap();
-        store.remember_listen_port(address.port()).unwrap();
         listener.set_nonblocking(true).unwrap();
         let pairing = Pairing::new(store);
         let hub = PeerHub::default();
@@ -35,7 +34,7 @@ impl Node {
                 thread_pairing,
                 sender,
                 SyncOptions {
-                    listen: Some(address),
+                    listen: address,
                     connect,
                 },
             )
@@ -63,7 +62,6 @@ fn seed(path: &Path, id: DeviceId) {
         id,
         name: format!("manual-{}", id[0]),
         peers: Vec::new(),
-        listen_port: None,
     };
     fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
 }
