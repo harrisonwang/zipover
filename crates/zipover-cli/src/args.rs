@@ -192,7 +192,7 @@ mod tests {
             let Command::Run { options, .. } = parse_str(&args).unwrap() else {
                 panic!()
             };
-            assert_eq!(options.listen, "0.0.0.0:57321".parse().unwrap());
+            assert_eq!(options.listen, "[::]:57321".parse().unwrap());
             args.extend(["--listen", "127.0.0.1:0"]);
             let Command::Run { options, .. } = parse_str(&args).unwrap() else {
                 panic!()

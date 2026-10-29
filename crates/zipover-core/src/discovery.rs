@@ -1,8 +1,11 @@
 use super::pairing::{DiscoveredPeer, SharedPairing};
 use crate::{config::DeviceConfig, protocol::PROTOCOL_VERSION};
 use anyhow::Result;
-use mdns_sd::{DaemonEvent, IfKind, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
-use std::net::SocketAddr;
+use mdns_sd::{
+    DaemonEvent, IfKind, Receiver, ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent,
+    ServiceInfo,
+};
+use std::net::{SocketAddr, SocketAddrV6};
 
 const SERVICE_TYPE: &str = "_zipover._tcp.local.";
 
@@ -59,7 +62,11 @@ impl Discovery {
                 &properties[..],
             )?;
         }
-        service.set_interfaces(vec![IfKind::IPv4]);
+        service.set_interfaces(vec![if address.is_ipv4() {
+            IfKind::IPv4
+        } else {
+            IfKind::All
+        }]);
         Ok(service)
     }
 
@@ -107,12 +114,7 @@ impl Discovery {
                     {
                         continue;
                     }
-                    let mut addresses: Vec<_> = info
-                        .get_addresses_v4()
-                        .into_iter()
-                        .map(|ip| SocketAddr::from((ip, info.get_port())))
-                        .collect();
-                    addresses.sort();
+                    let addresses = resolved_addresses(&info);
                     if addresses.is_empty() {
                         continue;
                     }
@@ -148,6 +150,30 @@ impl Discovery {
     }
 }
 
+fn resolved_addresses(info: &ResolvedService) -> Vec<SocketAddr> {
+    let mut addresses: Vec<_> = info
+        .get_addresses()
+        .iter()
+        .filter_map(|ip| match ip {
+            ScopedIp::V4(ip) => Some(SocketAddr::from((*ip.addr(), info.get_port()))),
+            ScopedIp::V6(ip) => Some(SocketAddr::V6(SocketAddrV6::new(
+                *ip.addr(),
+                info.get_port(),
+                0,
+                if ip.addr().is_unicast_link_local() {
+                    ip.scope_id().index
+                } else {
+                    0
+                },
+            ))),
+            _ => None,
+        })
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+}
+
 impl Drop for Discovery {
     fn drop(&mut self) {
         let _ = self.daemon.shutdown();
@@ -155,19 +181,5 @@ impl Drop for Discovery {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::TcpListener;
-
-    #[test]
-    fn service_advertises_the_actual_listener_port() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let config = DeviceConfig {
-            id: [1; 16],
-            name: "test".into(),
-            peers: Vec::new(),
-        };
-        let service = Discovery::service(&config, listener.local_addr().unwrap(), false).unwrap();
-        assert_eq!(service.get_port(), listener.local_addr().unwrap().port());
-    }
-}
+#[path = "discovery/tests.rs"]
+mod tests;

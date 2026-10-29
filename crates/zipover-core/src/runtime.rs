@@ -8,7 +8,9 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow};
 use arboard::Clipboard;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
+    io,
     net::{SocketAddr, TcpListener},
     sync::mpsc,
     thread,
@@ -23,7 +25,7 @@ pub struct SyncOptions {
 impl Default for SyncOptions {
     fn default() -> Self {
         Self {
-            listen: ([0, 0, 0, 0], 57321).into(),
+            listen: ([0u16; 8], 57321).into(),
             connect: None,
         }
     }
@@ -64,7 +66,7 @@ impl SyncRuntime {
             "访问系统剪贴板失败",
             "Unable to access the system clipboard",
         ))?;
-        let listener = TcpListener::bind(options.listen).with_context(|| {
+        let listener = bind_listener(options.listen).with_context(|| {
             crate::i18n::localized!(format,
                 "监听 {} 失败，请退出其他 Zipover 进程或使用 --listen 选择地址",
                 "Unable to listen on {}. Quit the other Zipover process or choose an address with --listen",
@@ -206,6 +208,18 @@ impl SyncRuntime {
     }
 }
 
+pub(crate) fn bind_listener(address: SocketAddr) -> io::Result<TcpListener> {
+    if address.is_ipv4() {
+        return TcpListener::bind(address);
+    }
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    // Set this explicitly because the default differs between operating systems.
+    socket.set_only_v6(false)?;
+    socket.bind(&address.into())?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
+
 impl Drop for SyncRuntime {
     fn drop(&mut self) {
         self.stop();
@@ -231,4 +245,45 @@ pub fn paired_devices() -> Result<Vec<DeviceInfo>> {
 
 pub fn forget_device(id: DeviceId) -> Result<()> {
     ConfigStore::load()?.forget(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream},
+        time::Duration,
+    };
+
+    #[test]
+    fn default_listener_accepts_ipv4_and_ipv6_on_the_same_port() {
+        let mut address = SyncOptions::default().listen;
+        address.set_port(0);
+        let listener = bind_listener(address).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let mut client =
+                TcpStream::connect_timeout(&SocketAddr::new(ip, port), Duration::from_secs(2))
+                    .unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            client.write_all(b"dual-stack").unwrap();
+            let (mut server, _) = listener.accept().unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut message = [0; 10];
+            server.read_exact(&mut message).unwrap();
+            assert_eq!(&message, b"dual-stack");
+            server.write_all(b"ok").unwrap();
+            let mut reply = [0; 2];
+            client.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"ok");
+        }
+    }
 }

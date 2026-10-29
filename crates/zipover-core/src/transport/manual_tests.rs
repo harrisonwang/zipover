@@ -115,6 +115,15 @@ fn probe(sender: &Node, recipients: &[&Node], text: &str) {
 
 #[test]
 fn manual_pairing_reconnects_multiple_authenticated_peers_after_restart_without_mdns() {
+    manual_pairing_round_trip("127.0.0.1:0".parse().unwrap());
+}
+
+#[test]
+fn ipv6_manual_pairing_persists_targets_and_transfers_encrypted_text_after_restart() {
+    manual_pairing_round_trip("[::1]:0".parse().unwrap());
+}
+
+fn manual_pairing_round_trip(listen: SocketAddr) {
     let root = std::env::temp_dir().join(format!(
         "zipover-manual-{}",
         hex::encode(random_bytes::<16>().unwrap())
@@ -129,9 +138,12 @@ fn manual_pairing_reconnects_multiple_authenticated_peers_after_restart_without_
     seed(&a_path, [3; 16]);
     seed(&b_path, [1; 16]);
     seed(&c_path, [2; 16]);
-    let b = Node::start(&b_path, None, None);
-    let c = Node::start(&c_path, None, None);
-    let a = Node::start(&a_path, None, Some(b.address.to_string()));
+    let b = Node::start(&b_path, Some(listen), None);
+    let c = Node::start(&c_path, Some(listen), None);
+    let a = Node::start(&a_path, Some(listen), Some(b.address.to_string()));
+    assert_eq!(a.address.ip(), listen.ip());
+    assert_eq!(b.address.ip(), listen.ip());
+    assert_eq!(c.address.ip(), listen.ip());
     let code = b.pairing.lock().unwrap().invite().unwrap();
     a.pairing.lock().unwrap().join(&code, None).unwrap();
     wait(|| a.pairing.lock().unwrap().store.config.peers.len() == 1);
