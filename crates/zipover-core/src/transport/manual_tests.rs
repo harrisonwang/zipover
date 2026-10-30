@@ -2,7 +2,6 @@ use super::*;
 use crate::{
     config::{ConfigStore, DeviceConfig, random_bytes},
     pairing::Pairing,
-    protocol::ClipboardPayload,
 };
 use std::{fs, path::Path, sync::mpsc::Receiver};
 
@@ -84,7 +83,8 @@ fn probe(sender: &Node, recipients: &[&Node], text: &str) {
             &sender.hub.active_peer_ids().unwrap(),
             &WireMessage::Clipboard {
                 id: format!("probe-{text}"),
-                payload: ClipboardPayload::Text(text.into()),
+                version: crate::protocol::ClipboardVersion::default(),
+                text: text.into(),
             },
         )
         .unwrap();
@@ -96,11 +96,7 @@ fn probe(sender: &Node, recipients: &[&Node], text: &str) {
                 .unwrap()
             {
                 IncomingEvent::Message {
-                    message:
-                        WireMessage::Clipboard {
-                            payload: ClipboardPayload::Text(value),
-                            ..
-                        },
+                    message: WireMessage::Clipboard { text: value, .. },
                     ..
                 } => {
                     assert_eq!(value, text);

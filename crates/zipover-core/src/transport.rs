@@ -14,7 +14,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, SyncSender},
+        mpsc::{self, SyncSender, TrySendError},
     },
     thread,
     time::{Duration, Instant},
@@ -31,6 +31,11 @@ const PEER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTGOING_QUEUE_SIZE: usize = 16;
 static NEXT_PEER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+pub(crate) struct OutgoingFrame {
+    bytes: Arc<[u8]>,
+    cancelled: Arc<AtomicBool>,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct PeerHub {
     peers: Arc<Mutex<Vec<Peer>>>,
@@ -40,7 +45,8 @@ pub(crate) struct PeerHub {
 struct Peer {
     peer_id: u64,
     device_id: DeviceId,
-    sender: SyncSender<Arc<[u8]>>,
+    sender: SyncSender<OutgoingFrame>,
+    control: mpsc::Sender<Arc<[u8]>>,
     alive: Arc<AtomicBool>,
     stream: TcpStream,
 }
@@ -50,7 +56,8 @@ impl PeerHub {
         &self,
         peer_id: u64,
         device_id: DeviceId,
-        sender: SyncSender<Arc<[u8]>>,
+        sender: SyncSender<OutgoingFrame>,
+        control: mpsc::Sender<Arc<[u8]>>,
         alive: Arc<AtomicBool>,
         stream: TcpStream,
     ) -> Result<bool> {
@@ -72,6 +79,7 @@ impl PeerHub {
             peer_id,
             device_id,
             sender,
+            control,
             alive,
             stream,
         });
@@ -151,45 +159,68 @@ impl PeerHub {
         Ok(())
     }
 
-    pub(crate) fn send_to_targets(&self, peer_ids: &[u64], message: &WireMessage) -> Result<()> {
-        if peer_ids.is_empty() {
-            crate::i18n::localized!(bail, "transport.no_connected_devices");
-        }
-        let frame = encode_message(message)?;
-        let targets = {
+    pub(crate) fn send_to(
+        &self,
+        peer_id: u64,
+        message: &WireMessage,
+        cancelled: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let mut frame = OutgoingFrame {
+            bytes: encode_message(message)?,
+            cancelled: cancelled.clone(),
+        };
+        let (sender, alive) = {
             let peers = self
                 .peers
                 .lock()
                 .map_err(|_| crate::i18n::localized!(anyhow, "transport.lock_poisoned"))?;
-            peer_ids
+            let peer = peers
                 .iter()
-                .filter_map(|peer_id| {
-                    peers
-                        .iter()
-                        .find(|peer| peer.peer_id == *peer_id)
-                        .map(|peer| (peer.sender.clone(), peer.alive.clone()))
-                })
-                .collect::<Vec<_>>()
+                .find(|peer| peer.peer_id == peer_id)
+                .context(crate::i18n::tr("transport.connection_closed"))?;
+            (peer.sender.clone(), peer.alive.clone())
         };
-        let mut sent = false;
-        for (sender, alive) in targets {
-            if !alive.load(Ordering::Relaxed) {
-                continue;
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                crate::i18n::localized!(bail, "sync.send_cancelled");
             }
-            match sender.send(frame.clone()) {
-                Ok(()) => sent = true,
-                Err(_) => {
-                    alive.store(false, Ordering::Relaxed);
+            if self.is_shutdown() || !alive.load(Ordering::Acquire) {
+                crate::i18n::localized!(bail, "transport.connection_closed");
+            }
+            match sender.try_send(frame) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(returned)) => frame = returned,
+                Err(TrySendError::Disconnected(_)) => {
+                    crate::i18n::localized!(bail, "transport.connection_closed");
                 }
             }
+            thread::sleep(Duration::from_millis(10));
         }
-        let mut peers = self
+    }
+
+    // 回执不与大文件共享有界数据队列，避免双方都在发送时阻塞剪贴板循环。
+    pub(crate) fn send_control(&self, peer_id: u64, message: &WireMessage) -> Result<()> {
+        let frame = encode_message(message)?;
+        let peers = self
             .peers
             .lock()
             .map_err(|_| crate::i18n::localized!(anyhow, "transport.lock_poisoned"))?;
-        peers.retain(|peer| peer.alive.load(Ordering::Relaxed));
-        if !sent {
-            crate::i18n::localized!(bail, "transport.connection_closed");
+        let peer = peers
+            .iter()
+            .find(|peer| peer.peer_id == peer_id)
+            .context(crate::i18n::tr("transport.connection_closed"))?;
+        peer.control
+            .send(frame)
+            .context(crate::i18n::tr("transport.connection_closed"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send_to_targets(&self, peer_ids: &[u64], message: &WireMessage) -> Result<()> {
+        if peer_ids.is_empty() {
+            crate::i18n::localized!(bail, "transport.no_connected_devices");
+        }
+        for peer_id in peer_ids {
+            self.send_to(*peer_id, message, &Arc::new(AtomicBool::new(false)))?;
         }
         Ok(())
     }
@@ -209,7 +240,7 @@ fn encode_message(message: &WireMessage) -> Result<Arc<[u8]>> {
 
 // 固定前导信息用于选择设备间的配对密钥；Noise 将完整前导信息绑定到握手记录，
 // 因而身份或模式被篡改时，认证会失败。
-const MAGIC: &[u8; 5] = b"ZPOV2";
+const MAGIC: &[u8; 5] = b"ZPOV3";
 const PREFACE_LEN: usize = 38;
 
 pub(crate) fn network_loop(
@@ -646,7 +677,8 @@ fn register_connection(
     hub: PeerHub,
     incoming: SyncSender<IncomingEvent>,
 ) -> Result<()> {
-    let (outgoing_tx, outgoing_rx) = mpsc::sync_channel::<Arc<[u8]>>(OUTGOING_QUEUE_SIZE);
+    let (outgoing_tx, outgoing_rx) = mpsc::sync_channel::<OutgoingFrame>(OUTGOING_QUEUE_SIZE);
+    let (control_tx, control_rx) = mpsc::channel();
     let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
     let alive = Arc::new(AtomicBool::new(true));
     let stream_for_shutdown = stream.try_clone()?;
@@ -656,6 +688,7 @@ fn register_connection(
         peer_id,
         device_id,
         outgoing_tx,
+        control_tx,
         alive.clone(),
         stream_for_shutdown,
     )? {
@@ -670,7 +703,19 @@ fn register_connection(
     let writer_alive = alive.clone();
     thread::spawn(move || {
         while writer_alive.load(Ordering::Relaxed) {
-            let Ok(frame) = outgoing_rx.recv() else { break };
+            let frame = match control_rx.try_recv() {
+                Ok(frame) => frame,
+                Err(_) => match outgoing_rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(frame) => {
+                        if frame.cancelled.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        frame.bytes
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                },
+            };
             if let Err(error) = cipher_writer.write_frame(&mut writer, &frame) {
                 crate::i18n::localized!(eprintln, "transport.send_failed", error = error : {:#});
                 break;
@@ -727,12 +772,16 @@ mod tests {
                 1,
                 [1; 16],
                 tx.clone(),
+                mpsc::channel().0,
                 alive.clone(),
                 stream.try_clone().unwrap()
             )
             .unwrap()
         );
-        assert!(!hub.add(2, [1; 16], tx, alive, stream).unwrap());
+        assert!(
+            !hub.add(2, [1; 16], tx, mpsc::channel().0, alive, stream)
+                .unwrap()
+        );
         assert_eq!(hub.devices(), vec![[1; 16]]);
         hub.shutdown();
         assert_eq!(client.read(&mut [0]).unwrap(), 0);
@@ -746,8 +795,15 @@ mod tests {
         let hub = PeerHub::default();
         let (tx, _rx) = mpsc::sync_channel(1);
         let alive = Arc::new(AtomicBool::new(true));
-        hub.add(1, [1; 16], tx, alive.clone(), stream.try_clone().unwrap())
-            .unwrap();
+        hub.add(
+            1,
+            [1; 16],
+            tx,
+            mpsc::channel().0,
+            alive.clone(),
+            stream.try_clone().unwrap(),
+        )
+        .unwrap();
         let (finished_tx, finished_rx) = mpsc::channel();
         let reader = thread::spawn(move || {
             finished_tx.send(stream.read(&mut [0])).unwrap();

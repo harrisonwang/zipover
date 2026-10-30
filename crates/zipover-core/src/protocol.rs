@@ -5,26 +5,32 @@ pub(crate) const FRAME_LIMIT: usize = 4 * 1024 * 1024;
 pub(crate) const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const MAX_TRANSFER_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 pub(crate) const MAX_MANIFEST_ENTRIES: usize = 100_000;
-pub(crate) const PROTOCOL_VERSION: u16 = 2;
+pub(crate) const PROTOCOL_VERSION: u16 = 3;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum ClipboardPayload {
-    Text(String),
-    Image {
-        width: u32,
-        height: u32,
-        bytes: Vec<u8>,
-    },
+// Lamport 次序使交叉复制和延迟完成的传输在各设备上得到相同结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct ClipboardVersion {
+    pub counter: u64,
+    pub origin: crate::config::DeviceId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DeliveryStatus {
+    Applied,
+    Rejected,
+    Superseded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum WireMessage {
     Clipboard {
         id: String,
-        payload: ClipboardPayload,
+        version: ClipboardVersion,
+        text: String,
     },
     TransferStart {
         id: String,
+        version: ClipboardVersion,
         entries: Vec<TransferEntry>,
     },
     TransferChunk {
@@ -46,6 +52,7 @@ pub(crate) enum WireMessage {
     },
     ImageStart {
         id: String,
+        version: ClipboardVersion,
         fingerprint: u64,
         width: u32,
         height: u32,
@@ -59,5 +66,9 @@ pub(crate) enum WireMessage {
     ImageEnd {
         id: String,
         sha256: [u8; 32],
+    },
+    DeliveryResult {
+        id: String,
+        status: DeliveryStatus,
     },
 }

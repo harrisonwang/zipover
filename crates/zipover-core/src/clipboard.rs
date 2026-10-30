@@ -1,7 +1,6 @@
 use crate::{
     files::{CapturedFiles, capture_files},
-    image::{CachedImage, CapturedImage, apply_image, capture_image},
-    protocol::ClipboardPayload,
+    image::{CachedImage, CapturedImage, capture_image},
 };
 use anyhow::{Context, Result, bail};
 use arboard::Clipboard;
@@ -82,20 +81,6 @@ pub(crate) fn capture_payload(
         return Ok(CapturedPayload::Text(text));
     }
     crate::i18n::localized!(bail, "clipboard.unsupported_content")
-}
-
-pub(crate) fn apply_payload(clipboard: &mut Clipboard, payload: &ClipboardPayload) -> Result<()> {
-    match payload {
-        ClipboardPayload::Text(text) => clipboard
-            .set_text(text)
-            .context(crate::i18n::tr("clipboard.write_text_failed"))?,
-        ClipboardPayload::Image {
-            width,
-            height,
-            bytes,
-        } => apply_image(clipboard, *width, *height, bytes)?,
-    }
-    Ok(())
 }
 
 pub(crate) fn set_file_list(clipboard: &mut Clipboard, paths: &[PathBuf]) -> Result<()> {

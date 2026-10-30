@@ -74,6 +74,7 @@ impl SyncRuntime {
                 None
             }
         };
+        let local_id = store.config.id;
         let pairing = Pairing::new(store);
         let hub = PeerHub::default();
         let (tx, rx) = mpsc::sync_channel(32);
@@ -91,7 +92,9 @@ impl SyncRuntime {
         }));
         let clipboard_thread = {
             let hub = hub.clone();
-            Some(thread::spawn(move || clipboard_loop(clipboard, hub, rx)))
+            Some(thread::spawn(move || {
+                clipboard_loop(clipboard, hub, rx, local_id)
+            }))
         };
         Ok(Self {
             local_addr,

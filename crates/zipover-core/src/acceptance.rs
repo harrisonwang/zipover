@@ -94,17 +94,27 @@ fn lan_round_trip() {
                 &peers,
                 &WireMessage::Clipboard {
                     id: "text".into(),
-                    payload: ClipboardPayload::Text(text),
+                    version: ClipboardVersion::default(),
+                    text,
                 },
             )?;
             send_file_transfer(
                 &hub,
-                &peers,
+                peers[0],
                 &format!("files-{round}"),
+                ClipboardVersion::default(),
                 &capture_files(std::slice::from_ref(&folder))?,
+                &Arc::new(AtomicBool::new(false)),
             )?;
             let image = image::test_image();
-            send_image_transfer(&hub, &peers, "image", &image)?;
+            send_image_transfer(
+                &hub,
+                peers[0],
+                "image",
+                ClipboardVersion::default(),
+                &image,
+                &Arc::new(AtomicBool::new(false)),
+            )?;
             let mut files = None;
             let mut image = None;
             let (mut got_text, mut got_files, mut got_image, mut got_ack, mut sent_ack) =
@@ -117,10 +127,7 @@ fn lan_round_trip() {
                     bail!("disconnected during fixture")
                 };
                 match message {
-                    WireMessage::Clipboard {
-                        id,
-                        payload: ClipboardPayload::Text(text),
-                    } => {
+                    WireMessage::Clipboard { id, text, .. } => {
                         if id == "ack" {
                             got_ack = true;
                         } else {
@@ -131,7 +138,7 @@ fn lan_round_trip() {
                             got_text = true;
                         }
                     }
-                    WireMessage::TransferStart { id, entries } => {
+                    WireMessage::TransferStart { id, entries, .. } => {
                         files = Some(IncomingTransfer::start(
                             id,
                             &format!("test-{}", timestamp_nanos()),
@@ -186,7 +193,8 @@ fn lan_round_trip() {
                         &peers,
                         &WireMessage::Clipboard {
                             id: "ack".into(),
-                            payload: ClipboardPayload::Text("ok".into()),
+                            version: ClipboardVersion::default(),
+                            text: "ok".into(),
                         },
                     )?;
                     sent_ack = true;

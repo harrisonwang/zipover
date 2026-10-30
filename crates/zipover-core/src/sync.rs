@@ -1,8 +1,8 @@
 use crate::{
-    clipboard::{CaptureCache, CapturedPayload, apply_payload, capture_payload, set_file_list},
+    clipboard::{CaptureCache, CapturedPayload, capture_payload, set_file_list},
     files::{IncomingTransfer, cleanup_cache, files_summary, send_file_transfer},
     image::{IncomingImage, send_image_transfer},
-    protocol::{ClipboardPayload, WireMessage},
+    protocol::{ClipboardVersion, DeliveryStatus, WireMessage},
     transport::{IncomingEvent, PeerHub},
 };
 #[cfg(test)]
@@ -10,12 +10,16 @@ use crate::{
     files::{self, TransferEntry, capture_files},
     protocol::CHUNK_SIZE,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use arboard::Clipboard;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
-    sync::mpsc::Receiver,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -32,6 +36,7 @@ const MAX_ACTIVE_IMAGES: usize = 4;
 const MAX_ACTIVE_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
 const INITIAL_SEND_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_SEND_RETRY_DELAY: Duration = Duration::from_secs(30);
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -50,12 +55,14 @@ impl SessionKey {
 }
 
 struct ActiveTransfer {
+    version: ClipboardVersion,
     last_activity: Instant,
     size: u64,
     transfer: IncomingTransfer,
 }
 
 struct ActiveImage {
+    version: ClipboardVersion,
     last_activity: Instant,
     image: IncomingImage,
     size: u64,
@@ -67,8 +74,10 @@ struct SendRetry {
 }
 
 struct OutgoingSend<'scope> {
-    generation: u64,
-    targets: Vec<u64>,
+    version: ClipboardVersion,
+    id: String,
+    cancelled: Arc<AtomicBool>,
+    receipt: SyncSender<DeliveryStatus>,
     job: thread::ScopedJoinHandle<'scope, Result<()>>,
 }
 
@@ -77,27 +86,31 @@ struct SyncState {
     sequence: u64,
     last_fingerprint: Option<u64>,
     sent_peers: HashSet<u64>,
-    send_generation: u64,
+    local_id: crate::config::DeviceId,
+    version: ClipboardVersion,
+    applied_version: Option<ClipboardVersion>,
     send_retries: HashMap<u64, SendRetry>,
     last_capture_error: Option<String>,
     last_send_error: Option<String>,
-    completed: SeenIds,
+    receipts: RecentDeliveries,
     active_transfers: HashMap<SessionKey, ActiveTransfer>,
     active_images: HashMap<SessionKey, ActiveImage>,
 }
 
 impl SyncState {
-    fn new() -> Self {
+    fn new(local_id: crate::config::DeviceId) -> Self {
         Self {
             origin: format!("{}-{}", std::process::id(), timestamp_nanos()),
             sequence: 0,
             last_fingerprint: None,
             sent_peers: HashSet::new(),
-            send_generation: 0,
+            local_id,
+            version: ClipboardVersion::default(),
+            applied_version: None,
             send_retries: HashMap::new(),
             last_capture_error: None,
             last_send_error: None,
-            completed: SeenIds::default(),
+            receipts: RecentDeliveries::default(),
             active_transfers: HashMap::new(),
             active_images: HashMap::new(),
         }
@@ -111,7 +124,11 @@ impl SyncState {
     fn observe_fingerprint(&mut self, fingerprint: u64) {
         if self.last_fingerprint != Some(fingerprint) {
             self.last_fingerprint = Some(fingerprint);
-            self.send_generation = self.send_generation.wrapping_add(1);
+            self.version = ClipboardVersion {
+                counter: self.version.counter + 1,
+                origin: self.local_id,
+            };
+            self.applied_version = Some(self.version);
             self.sent_peers.clear();
             self.send_retries.clear();
             self.last_send_error = None;
@@ -134,14 +151,14 @@ impl SyncState {
 
     fn complete_send(
         &mut self,
-        generation: u64,
+        version: ClipboardVersion,
         targets: &[u64],
         connected: &[u64],
         result: Result<()>,
         now: Instant,
     ) {
         // 接收端可能在发送任务运行时更新剪贴板，旧任务不能改变新内容的投递状态。
-        if generation != self.send_generation {
+        if version != self.version {
             return;
         }
         match result {
@@ -182,133 +199,324 @@ pub(crate) fn clipboard_loop(
     mut clipboard: Clipboard,
     hub: PeerHub,
     incoming: Receiver<IncomingEvent>,
+    local_id: crate::config::DeviceId,
 ) -> Result<()> {
-    let mut state = SyncState::new();
+    let mut state = SyncState::new(local_id);
     let mut cache = CaptureCache::default();
     let mut next_cache_cleanup = Instant::now();
 
     thread::scope(|scope| {
-        let mut outgoing: Option<OutgoingSend<'_>> = None;
+        let mut outgoing: HashMap<u64, OutgoingSend<'_>> = HashMap::new();
         let result = loop {
             if hub.is_shutdown() {
                 break Ok(());
             }
-            while let Ok(event) = incoming.try_recv() {
-                if let IncomingEvent::Message { peer_id, .. } = &event
-                    && !hub.is_connected(*peer_id)
+            for _ in 0..32 {
+                let Ok(event) = incoming.try_recv() else {
+                    break;
+                };
+                if let IncomingEvent::Message { peer_id, message } = &event {
+                    if !hub.is_connected(*peer_id) {
+                        continue;
+                    }
+                    if let WireMessage::DeliveryResult { id, status } = message {
+                        if let Some(send) = outgoing.get(peer_id).filter(|send| send.id == *id) {
+                            let _ = send.receipt.try_send(*status);
+                            send.cancelled.store(true, Ordering::Release);
+                        }
+                        continue;
+                    }
+                    // 在接受新版本或写入远端内容前再次采样，保留用户刚复制的新内容。
+                    if matches!(
+                        message,
+                        WireMessage::Clipboard { .. }
+                            | WireMessage::TransferStart { .. }
+                            | WireMessage::ImageStart { .. }
+                            | WireMessage::TransferEnd { .. }
+                            | WireMessage::ImageEnd { .. }
+                    ) && let Ok(payload) = capture_payload(&mut clipboard, &mut cache)
+                    {
+                        state.observe_fingerprint(captured_fingerprint(&payload));
+                        discard_obsolete_transfers(&mut state, &hub);
+                    }
+                    let id = message_id(message).to_owned();
+                    let peer_id = *peer_id;
+                    if let Err(error) =
+                        handle_incoming_event(event, &mut clipboard, &mut state, &hub)
+                    {
+                        let key = SessionKey::new(peer_id, id.clone());
+                        state.active_transfers.remove(&key);
+                        state.active_images.remove(&key);
+                        state.receipts.insert(&id, DeliveryStatus::Rejected);
+                        reply(&hub, peer_id, &id, DeliveryStatus::Rejected);
+                        eprintln!("{error:#}");
+                    }
+                } else if let Err(error) =
+                    handle_incoming_event(event, &mut clipboard, &mut state, &hub)
                 {
-                    continue;
-                }
-                if let Err(error) = handle_incoming_event(event, &mut clipboard, &mut state) {
-                    eprintln!("{error}");
+                    eprintln!("{error:#}");
                 }
             }
-            expire_sessions(&mut state);
+            expire_sessions(&mut state, &hub);
             if Instant::now() >= next_cache_cleanup {
                 cleanup_file_cache(&mut clipboard, &state);
                 next_cache_cleanup = Instant::now() + CACHE_MAINTENANCE_INTERVAL;
             }
 
-            if let Some(send) = outgoing.take_if(|send| send.job.is_finished()) {
+            let peers = match hub.active_peer_ids() {
+                Ok(peers) => peers,
+                Err(error) => break Err(error),
+            };
+            for (peer, send) in outgoing
+                .extract_if(|_, send| send.job.is_finished())
+                .collect::<Vec<_>>()
+            {
                 let result = send.job.join().unwrap_or_else(|_| {
                     Err(crate::i18n::localized!(
                         anyhow,
                         "sync.sending_thread_stopped"
                     ))
                 });
-                let peers = match hub.active_peer_ids() {
-                    Ok(peers) => peers,
-                    Err(error) => break Err(error),
-                };
-                state.complete_send(
-                    send.generation,
-                    &send.targets,
-                    &peers,
-                    result,
-                    Instant::now(),
-                );
+                state.complete_send(send.version, &[peer], &peers, result, Instant::now());
             }
-
-            if outgoing.is_none() {
-                let peers = match hub.active_peer_ids() {
-                    Ok(peers) => peers,
-                    Err(error) => break Err(error),
-                };
-                if !peers.is_empty() {
-                    match capture_payload(&mut clipboard, &mut cache) {
-                        Ok(payload) => {
-                            state.last_capture_error = None;
-                            let fingerprint = captured_fingerprint(&payload);
-                            state.observe_fingerprint(fingerprint);
-                            let targets = state.delivery_targets(&peers, Instant::now());
-
-                            if !targets.is_empty() {
+            if !peers.is_empty() {
+                match capture_payload(&mut clipboard, &mut cache) {
+                    Ok(payload) => {
+                        state.last_capture_error = None;
+                        state.observe_fingerprint(captured_fingerprint(&payload));
+                        discard_obsolete_transfers(&mut state, &hub);
+                        let internal =
+                            matches!(&payload, CapturedPayload::Files(files) if files.internal);
+                        if internal {
+                            state.sent_peers.extend(&peers);
+                        } else if state.applied_version == Some(state.version) {
+                            let payload = Arc::new(payload);
+                            for peer_id in state.delivery_targets(&peers, Instant::now()) {
+                                if outgoing.contains_key(&peer_id) {
+                                    continue;
+                                }
                                 let id = state.next_id();
-                                let summary = captured_summary(&payload);
+                                let version = state.version;
+                                let (receipt, receiver) = mpsc::sync_channel(1);
+                                let cancelled = Arc::new(AtomicBool::new(false));
+                                let worker_cancelled = cancelled.clone();
+                                let worker_id = id.clone();
+                                let payload = payload.clone();
+                                let hub = &hub;
                                 crate::i18n::localized!(
                                     eprintln,
                                     "sync.sending",
-                                    summary = summary
+                                    summary = captured_summary(&payload)
                                 );
-                                // 有界发送队列产生背压时，仍继续接收。
-                                let hub = &hub;
-                                let send_targets = targets.clone();
-                                outgoing = Some(OutgoingSend {
-                                    generation: state.send_generation,
-                                    targets,
-                                    job: scope.spawn(move || {
-                                        send_payload(hub, &send_targets, &id, payload)
-                                    }),
-                                });
+                                outgoing.insert(
+                                    peer_id,
+                                    OutgoingSend {
+                                        version,
+                                        id,
+                                        cancelled,
+                                        receipt,
+                                        job: scope.spawn(move || {
+                                            let queued = send_payload(
+                                                hub,
+                                                peer_id,
+                                                &worker_id,
+                                                version,
+                                                &payload,
+                                                &worker_cancelled,
+                                            );
+                                            wait_for_delivery(queued, &receiver, &worker_cancelled)
+                                        }),
+                                    },
+                                );
                             }
                         }
-                        Err(error) => {
-                            let message = format!("{error:#}");
-                            if state.last_capture_error.as_deref() != Some(&message) {
-                                crate::i18n::localized!(
-                                    eprintln,
-                                    "sync.capture_failed",
-                                    message = message
-                                );
-                                state.last_capture_error = Some(message);
-                            }
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        if state.last_capture_error.as_deref() != Some(&message) {
+                            crate::i18n::localized!(
+                                eprintln,
+                                "sync.capture_failed",
+                                message = message
+                            );
+                            state.last_capture_error = Some(message);
                         }
                     }
                 }
             }
-
+            for (peer_id, send) in &outgoing {
+                if send.version != state.version || !peers.contains(peer_id) {
+                    send.cancelled.store(true, Ordering::Release);
+                }
+            }
             thread::sleep(POLL_INTERVAL);
         };
-        // 在线程作用域等待发送任务结束前，先解除套接字写入的阻塞。
+        for send in outgoing.values() {
+            send.cancelled.store(true, Ordering::Release);
+        }
         hub.shutdown();
         result
     })
 }
 
-fn send_payload(hub: &PeerHub, peers: &[u64], id: &str, payload: CapturedPayload) -> Result<()> {
-    match payload {
-        CapturedPayload::Text(text) => hub.send_to_targets(
-            peers,
-            &WireMessage::Clipboard {
-                id: id.to_string(),
-                payload: ClipboardPayload::Text(text),
-            },
-        ),
-        CapturedPayload::Image(image) => send_image_transfer(hub, peers, id, &image),
-        CapturedPayload::Files(files) => {
-            if files.internal {
-                crate::i18n::localized!(eprintln, "sync.ignored_internal_paths");
-                return Ok(());
+fn wait_for_delivery(
+    queued: Result<()>,
+    receipt: &Receiver<DeliveryStatus>,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    let mut result = receipt.try_recv().ok();
+    if result.is_none() && !cancelled.load(Ordering::Acquire) {
+        queued?;
+    }
+    loop {
+        if let Some(status) = result {
+            return match status {
+                DeliveryStatus::Applied | DeliveryStatus::Superseded => Ok(()),
+                DeliveryStatus::Rejected => {
+                    Err(crate::i18n::localized!(anyhow, "sync.delivery_rejected"))
+                }
+            };
+        }
+        if cancelled.load(Ordering::Acquire) {
+            if let Ok(status) = receipt.try_recv() {
+                result = Some(status);
+                continue;
             }
-            send_file_transfer(hub, peers, id, &files)
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            crate::i18n::localized!(bail, "sync.delivery_timeout");
+        }
+        match receipt.recv_timeout(Duration::from_millis(20)) {
+            Ok(status) => result = Some(status),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                crate::i18n::localized!(bail, "transport.connection_closed");
+            }
         }
     }
+}
+
+fn send_payload(
+    hub: &PeerHub,
+    peer_id: u64,
+    id: &str,
+    version: ClipboardVersion,
+    payload: &CapturedPayload,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<()> {
+    match payload {
+        CapturedPayload::Text(text) => hub.send_to(
+            peer_id,
+            &WireMessage::Clipboard {
+                id: id.to_owned(),
+                version,
+                text: text.clone(),
+            },
+            cancelled,
+        ),
+        CapturedPayload::Image(image) => {
+            send_image_transfer(hub, peer_id, id, version, image, cancelled)
+        }
+        CapturedPayload::Files(files) => {
+            send_file_transfer(hub, peer_id, id, version, files, cancelled)
+        }
+    }
+}
+
+fn message_id(message: &WireMessage) -> &str {
+    match message {
+        WireMessage::Clipboard { id, .. }
+        | WireMessage::TransferStart { id, .. }
+        | WireMessage::TransferChunk { id, .. }
+        | WireMessage::TransferFileEnd { id, .. }
+        | WireMessage::TransferEnd { id }
+        | WireMessage::TransferAbort { id }
+        | WireMessage::ImageStart { id, .. }
+        | WireMessage::ImageChunk { id, .. }
+        | WireMessage::ImageEnd { id, .. }
+        | WireMessage::DeliveryResult { id, .. } => id,
+    }
+}
+
+fn reply(hub: &PeerHub, peer_id: u64, id: &str, status: DeliveryStatus) {
+    let _ = hub.send_control(
+        peer_id,
+        &WireMessage::DeliveryResult {
+            id: id.to_owned(),
+            status,
+        },
+    );
+}
+
+fn accept_version(
+    state: &mut SyncState,
+    hub: &PeerHub,
+    peer_id: u64,
+    id: &str,
+    version: ClipboardVersion,
+) -> bool {
+    if version < state.version {
+        state.receipts.insert(id, DeliveryStatus::Superseded);
+        reply(hub, peer_id, id, DeliveryStatus::Superseded);
+        return false;
+    }
+    if state.applied_version == Some(version) {
+        state.receipts.insert(id, DeliveryStatus::Applied);
+        reply(hub, peer_id, id, DeliveryStatus::Applied);
+        return false;
+    }
+    if version > state.version {
+        state.version = version;
+        state.sent_peers.clear();
+        state.send_retries.clear();
+        state.last_send_error = None;
+        discard_obsolete_transfers(state, hub);
+    }
+    true
+}
+
+fn discard_obsolete_transfers(state: &mut SyncState, hub: &PeerHub) {
+    state.active_transfers.retain(|key, active| {
+        if active.version < state.version {
+            state
+                .receipts
+                .insert(&key.message_id, DeliveryStatus::Superseded);
+            reply(
+                hub,
+                key.peer_id,
+                &key.message_id,
+                DeliveryStatus::Superseded,
+            );
+            false
+        } else {
+            true
+        }
+    });
+    state.active_images.retain(|key, active| {
+        if active.version < state.version {
+            state
+                .receipts
+                .insert(&key.message_id, DeliveryStatus::Superseded);
+            reply(
+                hub,
+                key.peer_id,
+                &key.message_id,
+                DeliveryStatus::Superseded,
+            );
+            false
+        } else {
+            true
+        }
+    });
 }
 
 fn handle_incoming_event(
     event: IncomingEvent,
     clipboard: &mut Clipboard,
     state: &mut SyncState,
+    hub: &PeerHub,
 ) -> Result<()> {
     let (peer_id, message) = match event {
         IncomingEvent::Message { peer_id, message } => (peer_id, message),
@@ -320,37 +528,57 @@ fn handle_incoming_event(
         }
     };
 
+    let id = message_id(&message);
+    if !valid_message_id(id) {
+        return Ok(());
+    }
+    if let Some(status) = state.receipts.get(id) {
+        if matches!(
+            message,
+            WireMessage::Clipboard { .. }
+                | WireMessage::TransferStart { .. }
+                | WireMessage::ImageStart { .. }
+                | WireMessage::TransferEnd { .. }
+                | WireMessage::ImageEnd { .. }
+        ) {
+            reply(hub, peer_id, id, status);
+        }
+        return Ok(());
+    }
     match message {
-        WireMessage::Clipboard { id, payload } => {
-            if !valid_message_id(&id) || state.completed.contains(&id) {
+        WireMessage::Clipboard { id, version, text } => {
+            if !valid_message_id(&id) || !accept_version(state, hub, peer_id, &id, version) {
                 return Ok(());
             }
-            let fingerprint = fingerprint(&payload);
-            let summary = payload_summary(&payload);
+            let fingerprint = text_fingerprint(&text);
+            let summary = text_summary(&text);
             crate::i18n::localized!(eprintln, "sync.received", summary = summary);
-            apply_payload(clipboard, &payload).map_err(
-                |error| crate::i18n::localized!(anyhow, "sync.apply_failed", error = error : {:#}),
-            )?;
-            state.completed.insert(&id);
-            mark_remote_applied(state, fingerprint, peer_id);
+            clipboard
+                .set_text(text)
+                .context(crate::i18n::tr("clipboard.write_text_failed"))?;
+            state.receipts.insert(&id, DeliveryStatus::Applied);
+            mark_remote_applied(state, fingerprint, peer_id, version);
+            reply(hub, peer_id, &id, DeliveryStatus::Applied);
             crate::i18n::localized!(eprintln, "sync.applied", summary = summary);
         }
-        WireMessage::TransferStart { id, entries } => {
-            if !valid_message_id(&id) || state.completed.contains(&id) {
+        WireMessage::TransferStart {
+            id,
+            version,
+            entries,
+        } => {
+            if !valid_message_id(&id) || !accept_version(state, hub, peer_id, &id, version) {
                 return Ok(());
             }
             let key = SessionKey::new(peer_id, id.clone());
             state.active_transfers.remove(&key);
             if state.active_transfers.len() >= MAX_ACTIVE_TRANSFERS {
-                crate::i18n::localized!(eprintln, "sync.too_many_file_transfers");
-                return Ok(());
+                crate::i18n::localized!(bail, "sync.too_many_file_transfers");
             }
             let Some(transfer_size) = entries
                 .iter()
                 .try_fold(0u64, |total, entry| total.checked_add(entry.size))
             else {
-                crate::i18n::localized!(eprintln, "sync.file_size_overflow");
-                return Ok(());
+                crate::i18n::localized!(bail, "sync.file_size_overflow");
             };
             let active_size = state
                 .active_transfers
@@ -358,8 +586,7 @@ fn handle_incoming_event(
                 .map(|active| active.size)
                 .sum::<u64>();
             if active_size.saturating_add(transfer_size) > MAX_ACTIVE_TRANSFER_BYTES {
-                crate::i18n::localized!(eprintln, "sync.file_size_limit");
-                return Ok(());
+                crate::i18n::localized!(bail, "sync.file_size_limit");
             }
             let cache_scope = format!("{}-{peer_id}", state.origin);
             let transfer = IncomingTransfer::start(id, &cache_scope, entries, &protected_cache_paths(clipboard, state)?).map_err(|error| {
@@ -373,6 +600,7 @@ fn handle_incoming_event(
             state.active_transfers.insert(
                 key,
                 ActiveTransfer {
+                    version,
                     last_activity: Instant::now(),
                     size: transfer_size,
                     transfer,
@@ -385,7 +613,7 @@ fn handle_incoming_event(
             offset,
             bytes,
         } => {
-            if !valid_message_id(&id) || state.completed.contains(&id) {
+            if !valid_message_id(&id) {
                 return Ok(());
             }
             let key = SessionKey::new(peer_id, id);
@@ -394,8 +622,9 @@ fn handle_incoming_event(
             };
             active.last_activity = Instant::now();
             if let Err(error) = active.transfer.accept_chunk(file_index, offset, &bytes) {
-                crate::i18n::localized!(eprintln, "sync.file_chunk_failed", error = error : {:#});
-                state.active_transfers.remove(&key);
+                return Err(
+                    crate::i18n::localized!(anyhow, "sync.file_chunk_failed", error = error : {:#}),
+                );
             }
         }
         WireMessage::TransferFileEnd {
@@ -403,7 +632,7 @@ fn handle_incoming_event(
             file_index,
             sha256,
         } => {
-            if !valid_message_id(&id) || state.completed.contains(&id) {
+            if !valid_message_id(&id) {
                 return Ok(());
             }
             let key = SessionKey::new(peer_id, id);
@@ -412,8 +641,9 @@ fn handle_incoming_event(
             };
             active.last_activity = Instant::now();
             if let Err(error) = active.transfer.finish_file(file_index, sha256) {
-                crate::i18n::localized!(eprintln, "sync.file_verification_failed", error = error : {:#});
-                state.active_transfers.remove(&key);
+                return Err(
+                    crate::i18n::localized!(anyhow, "sync.file_verification_failed", error = error : {:#}),
+                );
             }
         }
         WireMessage::TransferEnd { id } => {
@@ -421,14 +651,11 @@ fn handle_incoming_event(
                 return Ok(());
             }
             let key = SessionKey::new(peer_id, id.clone());
-            if state.completed.contains(&id) {
-                state.active_transfers.remove(&key);
-                return Ok(());
-            }
             let Some(active) = state.active_transfers.remove(&key) else {
                 crate::i18n::localized!(eprintln, "sync.file_transfer_missing", id = id);
                 return Ok(());
             };
+            let version = active.version;
             let summary = active.transfer.summary();
             let finished = active.transfer.finish().map_err(|error| {
                 crate::i18n::localized!(anyhow, "sync.file_completion_failed", error = error : {:#})
@@ -439,12 +666,15 @@ fn handle_incoming_event(
                     crate::i18n::localized!(anyhow, "sync.write_file_list_failed", error = error : {:#}),
                 );
             }
-            state.completed.insert(&id);
-            mark_remote_applied(state, finished.fingerprint, peer_id);
+            state.receipts.insert(&id, DeliveryStatus::Applied);
+            mark_remote_applied(state, finished.fingerprint, peer_id, version);
+            reply(hub, peer_id, &id, DeliveryStatus::Applied);
             cleanup_file_cache(clipboard, state);
             crate::i18n::localized!(eprintln, "sync.completed", summary = summary);
         }
         WireMessage::TransferAbort { id } => {
+            // 控制帧可能先于已入队的开始帧抵达，记录终态以免重新创建废弃会话。
+            state.receipts.insert(&id, DeliveryStatus::Rejected);
             let key = SessionKey::new(peer_id, id);
             state.active_transfers.remove(&key);
             state.active_images.remove(&key);
@@ -452,18 +682,18 @@ fn handle_incoming_event(
         }
         WireMessage::ImageStart {
             id,
+            version,
             fingerprint,
             width,
             height,
             size,
         } => {
-            if !valid_message_id(&id) || state.completed.contains(&id) {
+            if !valid_message_id(&id) || !accept_version(state, hub, peer_id, &id, version) {
                 return Ok(());
             }
-            let key = SessionKey::new(peer_id, id);
+            let key = SessionKey::new(peer_id, id.clone());
             if state.active_images.len() >= MAX_ACTIVE_IMAGES {
-                crate::i18n::localized!(eprintln, "sync.too_many_image_transfers");
-                return Ok(());
+                crate::i18n::localized!(bail, "sync.too_many_image_transfers");
             }
             let active_size = state
                 .active_images
@@ -471,8 +701,7 @@ fn handle_incoming_event(
                 .map(|active| active.size)
                 .sum::<u64>();
             if active_size.saturating_add(size) > MAX_ACTIVE_IMAGE_BYTES {
-                crate::i18n::localized!(eprintln, "sync.image_resource_limit");
-                return Ok(());
+                crate::i18n::localized!(bail, "sync.image_resource_limit");
             }
             let image = IncomingImage::start(fingerprint, width, height, size).map_err(|error| {
                 crate::i18n::localized!(anyhow, "sync.image_transfer_rejected", error = error : {:#})
@@ -487,6 +716,7 @@ fn handle_incoming_event(
             state.active_images.insert(
                 key,
                 ActiveImage {
+                    version,
                     last_activity: Instant::now(),
                     image,
                     size,
@@ -494,7 +724,7 @@ fn handle_incoming_event(
             );
         }
         WireMessage::ImageChunk { id, offset, bytes } => {
-            if !valid_message_id(&id) || state.completed.contains(&id) {
+            if !valid_message_id(&id) {
                 return Ok(());
             }
             let key = SessionKey::new(peer_id, id);
@@ -503,8 +733,9 @@ fn handle_incoming_event(
             };
             active.last_activity = Instant::now();
             if let Err(error) = active.image.accept_chunk(offset, &bytes) {
-                crate::i18n::localized!(eprintln, "sync.image_chunk_failed", error = error : {:#});
-                state.active_images.remove(&key);
+                return Err(
+                    crate::i18n::localized!(anyhow, "sync.image_chunk_failed", error = error : {:#}),
+                );
             }
         }
         WireMessage::ImageEnd { id, sha256 } => {
@@ -512,31 +743,35 @@ fn handle_incoming_event(
                 return Ok(());
             }
             let key = SessionKey::new(peer_id, id.clone());
-            if state.completed.contains(&id) {
-                state.active_images.remove(&key);
-                return Ok(());
-            }
             let Some(active) = state.active_images.remove(&key) else {
                 crate::i18n::localized!(eprintln, "sync.image_transfer_missing", id = id);
                 return Ok(());
             };
+            let version = active.version;
             let (fingerprint, image) = active.image.finish(sha256).map_err(|error| {
                 crate::i18n::localized!(anyhow, "sync.image_completion_failed", error = error : {:#})
             })?;
             clipboard.set_image(image).map_err(|error| {
                 crate::i18n::localized!(anyhow, "sync.apply_image_failed", error = error : {:#})
             })?;
-            state.completed.insert(&id);
-            mark_remote_applied(state, fingerprint, peer_id);
+            state.receipts.insert(&id, DeliveryStatus::Applied);
+            mark_remote_applied(state, fingerprint, peer_id, version);
+            reply(hub, peer_id, &id, DeliveryStatus::Applied);
             crate::i18n::localized!(eprintln, "sync.image_applied");
         }
+        WireMessage::DeliveryResult { .. } => {}
     }
     Ok(())
 }
 
-fn mark_remote_applied(state: &mut SyncState, fingerprint: u64, peer_id: u64) {
-    state.observe_fingerprint(fingerprint);
-    state.send_generation = state.send_generation.wrapping_add(1);
+fn mark_remote_applied(
+    state: &mut SyncState,
+    fingerprint: u64,
+    peer_id: u64,
+    version: ClipboardVersion,
+) {
+    state.last_fingerprint = Some(fingerprint);
+    state.applied_version = Some(version);
     state.send_retries.clear();
     state.sent_peers.insert(peer_id);
     state.last_send_error = None;
@@ -580,37 +815,26 @@ fn protected_cache_paths(
     Ok(protected)
 }
 
-fn expire_sessions(state: &mut SyncState) {
+fn expire_sessions(state: &mut SyncState, hub: &PeerHub) {
     let now = Instant::now();
-    state
-        .active_transfers
-        .retain(|_, active| now.duration_since(active.last_activity) < SESSION_IDLE_TIMEOUT);
-    state
-        .active_images
-        .retain(|_, active| now.duration_since(active.last_activity) < SESSION_IDLE_TIMEOUT);
+    state.active_transfers.retain(|key, active| {
+        let keep = now.duration_since(active.last_activity) < SESSION_IDLE_TIMEOUT;
+        if !keep {
+            reply(hub, key.peer_id, &key.message_id, DeliveryStatus::Rejected);
+        }
+        keep
+    });
+    state.active_images.retain(|key, active| {
+        let keep = now.duration_since(active.last_activity) < SESSION_IDLE_TIMEOUT;
+        if !keep {
+            reply(hub, key.peer_id, &key.message_id, DeliveryStatus::Rejected);
+        }
+        keep
+    });
 }
 
 fn valid_message_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_MESSAGE_ID_LEN
-}
-
-fn payload_summary(payload: &ClipboardPayload) -> String {
-    match payload {
-        ClipboardPayload::Text(text) => text_summary(text),
-        ClipboardPayload::Image {
-            width,
-            height,
-            bytes,
-        } => {
-            crate::i18n::localized!(
-                format,
-                "image.summary",
-                width = width,
-                height = height,
-                size = format_bytes(bytes.len() as u64)
-            )
-        }
-    }
 }
 
 fn text_summary(text: &str) -> String {
@@ -655,27 +879,6 @@ fn captured_fingerprint(payload: &CapturedPayload) -> u64 {
     }
 }
 
-fn fingerprint(payload: &ClipboardPayload) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    match payload {
-        ClipboardPayload::Text(text) => {
-            0u8.hash(&mut hasher);
-            text.hash(&mut hasher);
-        }
-        ClipboardPayload::Image {
-            width,
-            height,
-            bytes,
-        } => {
-            1u8.hash(&mut hasher);
-            width.hash(&mut hasher);
-            height.hash(&mut hasher);
-            bytes.hash(&mut hasher);
-        }
-    }
-    hasher.finish()
-}
-
 fn text_fingerprint(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     0u8.hash(&mut hasher);
@@ -691,27 +894,27 @@ fn timestamp_nanos() -> u128 {
 }
 
 #[derive(Default)]
-struct SeenIds {
-    set: HashSet<String>,
+struct RecentDeliveries {
+    statuses: HashMap<String, DeliveryStatus>,
     order: VecDeque<String>,
 }
 
-impl SeenIds {
-    fn contains(&self, id: &str) -> bool {
-        self.set.contains(id)
+impl RecentDeliveries {
+    fn get(&self, id: &str) -> Option<DeliveryStatus> {
+        self.statuses.get(id).copied()
     }
 
-    fn insert(&mut self, id: &str) -> bool {
-        if !self.set.insert(id.to_owned()) {
-            return false;
+    fn insert(&mut self, id: &str, status: DeliveryStatus) {
+        if self.statuses.contains_key(id) {
+            return;
         }
+        self.statuses.insert(id.to_owned(), status);
         self.order.push_back(id.to_owned());
         if self.order.len() > 256
             && let Some(oldest) = self.order.pop_front()
         {
-            self.set.remove(&oldest);
+            self.statuses.remove(&oldest);
         }
-        true
     }
 }
 
@@ -800,34 +1003,36 @@ mod tests {
 
     #[test]
     fn sync_state_generates_unique_message_ids() {
-        let mut state = SyncState::new();
+        let mut state = SyncState::new([1; 16]);
         assert_ne!(state.next_id(), state.next_id());
     }
 
     #[test]
     fn remote_clipboard_resets_delivery_tracking() {
-        let mut state = SyncState::new();
+        let mut state = SyncState::new([1; 16]);
         state.observe_fingerprint(1);
         state.sent_peers.extend([2, 3]);
 
-        mark_remote_applied(&mut state, 2, 4);
+        state.observe_fingerprint(2);
+        let remote_version = state.version;
+        mark_remote_applied(&mut state, 2, 4, remote_version);
         assert_eq!(state.sent_peers, HashSet::from([4]));
 
-        mark_remote_applied(&mut state, 2, 5);
+        mark_remote_applied(&mut state, 2, 5, remote_version);
         assert_eq!(state.sent_peers, HashSet::from([4, 5]));
     }
 
     #[test]
     fn transient_send_failure_retries_without_resending_successful_peers() {
-        let mut state = SyncState::new();
+        let mut state = SyncState::new([1; 16]);
         let now = Instant::now();
         state.observe_fingerprint(1);
-        let generation = state.send_generation;
-        state.complete_send(generation, &[2], &[2, 3], Ok(()), now);
+        let version = state.version;
+        state.complete_send(version, &[2], &[2, 3], Ok(()), now);
         assert_eq!(state.delivery_targets(&[2, 3], now), vec![3]);
 
         state.complete_send(
-            generation,
+            version,
             &[3],
             &[2, 3],
             Err(anyhow!("temporary file read failure")),
@@ -836,19 +1041,100 @@ mod tests {
         assert!(state.delivery_targets(&[2, 3], now).is_empty());
         let retry_at = now + INITIAL_SEND_RETRY_DELAY;
         assert_eq!(state.delivery_targets(&[2, 3], retry_at), vec![3]);
-        state.complete_send(generation, &[3], &[2, 3], Ok(()), retry_at);
+        state.complete_send(version, &[3], &[2, 3], Ok(()), retry_at);
         assert!(state.delivery_targets(&[2, 3], retry_at).is_empty());
         assert!(state.send_retries.is_empty());
     }
 
     #[test]
+    fn receiver_rejection_retries_unchanged_content_until_applied() {
+        let mut state = SyncState::new([1; 16]);
+        state.observe_fingerprint(42);
+        let now = Instant::now();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let cancelled = AtomicBool::new(false);
+        sender.send(DeliveryStatus::Rejected).unwrap();
+        let result = wait_for_delivery(Ok(()), &receiver, &cancelled);
+        assert!(result.is_err());
+        state.complete_send(state.version, &[2], &[2], result, now);
+        assert!(state.sent_peers.is_empty());
+        assert_eq!(
+            state.delivery_targets(&[2], now + INITIAL_SEND_RETRY_DELAY),
+            [2]
+        );
+
+        sender.send(DeliveryStatus::Applied).unwrap();
+        let result = wait_for_delivery(Ok(()), &receiver, &cancelled);
+        state.complete_send(
+            state.version,
+            &[2],
+            &[2],
+            result,
+            now + INITIAL_SEND_RETRY_DELAY,
+        );
+        assert_eq!(state.last_fingerprint, Some(42));
+        assert_eq!(state.sent_peers, HashSet::from([2]));
+        assert!(state.send_retries.is_empty());
+    }
+
+    #[test]
+    fn newer_clipboard_discards_partial_files_and_rejects_late_old_content() {
+        let hub = PeerHub::default();
+        let mut state = SyncState::new([2; 16]);
+        state.observe_fingerprint(1);
+        let old_version = state.version;
+        let mut transfer = IncomingTransfer::start(
+            "superseded".into(),
+            "test",
+            vec![TransferEntry {
+                path: b"partial.txt".to_vec(),
+                kind: files::TransferEntryKind::File,
+                size: 100,
+                mode: None,
+            }],
+            &[],
+        )
+        .unwrap();
+        transfer.accept_chunk(0, 0, b"partial").unwrap();
+        let directory = transfer.cache_directory().to_owned();
+        state.active_transfers.insert(
+            SessionKey::new(1, "old".into()),
+            ActiveTransfer {
+                version: old_version,
+                last_activity: Instant::now(),
+                size: 100,
+                transfer,
+            },
+        );
+        state.observe_fingerprint(2);
+        discard_obsolete_transfers(&mut state, &hub);
+        assert!(state.active_transfers.is_empty());
+        assert!(!directory.exists());
+        assert!(!accept_version(&mut state, &hub, 1, "late", old_version));
+        assert_eq!(state.last_fingerprint, Some(2));
+
+        let mut other = SyncState::new([1; 16]);
+        other.observe_fingerprint(3);
+        other.observe_fingerprint(4);
+        assert!(!accept_version(
+            &mut state,
+            &hub,
+            1,
+            "concurrent",
+            other.version
+        ));
+        assert!(accept_version(&mut other, &hub, 2, "newer", state.version));
+        assert_eq!(state.version, other.version);
+    }
+
+    #[test]
     fn repeated_failures_back_off_until_content_changes() {
-        let mut state = SyncState::new();
+        let mut state = SyncState::new([1; 16]);
         let mut now = Instant::now();
         state.observe_fingerprint(1);
         for delay in [1, 2, 4, 8, 16, 30, 30] {
             state.complete_send(
-                state.send_generation,
+                state.version,
                 &[2],
                 &[2],
                 Err(anyhow!("temporarily unavailable")),
@@ -863,7 +1149,7 @@ mod tests {
             assert_eq!(state.delivery_targets(&[2], now), vec![2]);
         }
         state.complete_send(
-            state.send_generation,
+            state.version,
             &[2],
             &[2],
             Err(anyhow!("temporarily unavailable")),
@@ -877,11 +1163,13 @@ mod tests {
     #[test]
     fn old_send_results_cannot_overwrite_remote_clipboard_delivery() {
         for result in [Ok(()), Err(anyhow!("old transfer failed"))] {
-            let mut state = SyncState::new();
+            let mut state = SyncState::new([1; 16]);
             state.observe_fingerprint(1);
-            let generation = state.send_generation;
-            mark_remote_applied(&mut state, 2, 4);
-            state.complete_send(generation, &[2, 3], &[2, 3, 4], result, Instant::now());
+            let version = state.version;
+            state.observe_fingerprint(2);
+            let remote_version = state.version;
+            mark_remote_applied(&mut state, 2, 4, remote_version);
+            state.complete_send(version, &[2, 3], &[2, 3, 4], result, Instant::now());
             assert_eq!(state.last_fingerprint, Some(2));
             assert_eq!(state.sent_peers, HashSet::from([4]));
             assert!(state.send_retries.is_empty());
@@ -891,19 +1179,10 @@ mod tests {
 
     #[test]
     fn completed_broadcast_only_marks_targets_still_connected() {
-        let mut state = SyncState::new();
+        let mut state = SyncState::new([1; 16]);
         state.observe_fingerprint(1);
-        state.complete_send(state.send_generation, &[2, 3], &[3], Ok(()), Instant::now());
+        state.complete_send(state.version, &[2, 3], &[3], Ok(()), Instant::now());
         assert_eq!(state.sent_peers, HashSet::from([3]));
-    }
-
-    #[test]
-    fn captured_text_matches_wire_text_fingerprint() {
-        let text = "hello";
-        assert_eq!(
-            text_fingerprint(text),
-            fingerprint(&ClipboardPayload::Text(text.to_owned()))
-        );
     }
 
     #[test]

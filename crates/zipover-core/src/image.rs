@@ -94,9 +94,11 @@ pub(crate) fn capture_image(
 
 pub(crate) fn send_image_transfer(
     hub: &PeerHub,
-    peers: &[u64],
+    peer_id: u64,
     id: &str,
+    version: crate::protocol::ClipboardVersion,
     image: &CapturedImage,
+    cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let result = (|| {
         let size =
@@ -108,41 +110,45 @@ pub(crate) fn send_image_transfer(
                 limit = format_bytes(MAX_IMAGE_TRANSFER_BYTES as u64)
             );
         }
-        hub.send_to_targets(
-            peers,
+        hub.send_to(
+            peer_id,
             &WireMessage::ImageStart {
                 id: id.to_string(),
+                version,
                 fingerprint: image.fingerprint,
                 width: image.width,
                 height: image.height,
                 size,
             },
+            cancelled,
         )?;
 
         let mut offset = 0u64;
         for chunk in image.bytes.chunks(CHUNK_SIZE) {
-            hub.send_to_targets(
-                peers,
+            hub.send_to(
+                peer_id,
                 &WireMessage::ImageChunk {
                     id: id.to_string(),
                     offset,
                     bytes: chunk.to_vec(),
                 },
+                cancelled,
             )?;
             offset += chunk.len() as u64;
         }
         let sha256: [u8; 32] = Sha256::digest(image.bytes.as_ref()).into();
-        hub.send_to_targets(
-            peers,
+        hub.send_to(
+            peer_id,
             &WireMessage::ImageEnd {
                 id: id.to_string(),
                 sha256,
             },
+            cancelled,
         )?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = hub.send_to_targets(peers, &WireMessage::TransferAbort { id: id.to_string() });
+        let _ = hub.send_control(peer_id, &WireMessage::TransferAbort { id: id.to_string() });
     }
     result
 }
@@ -221,26 +227,6 @@ impl IncomingImage {
             },
         ))
     }
-}
-
-pub(crate) fn apply_image(
-    clipboard: &mut Clipboard,
-    width: u32,
-    height: u32,
-    bytes: &[u8],
-) -> Result<()> {
-    let (decoded_width, decoded_height, decoded) = decode_png(bytes)?;
-    if decoded_width != width || decoded_height != height {
-        crate::i18n::localized!(bail, "image.dimensions_mismatch")
-    }
-    clipboard
-        .set_image(ImageData {
-            width: decoded_width as usize,
-            height: decoded_height as usize,
-            bytes: Cow::Owned(decoded),
-        })
-        .context(crate::i18n::tr("image.write_failed"))?;
-    Ok(())
 }
 
 fn rgba_size(width: u32, height: u32) -> Result<usize> {

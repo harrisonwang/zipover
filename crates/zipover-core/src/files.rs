@@ -214,22 +214,26 @@ fn manifest_identity(
 
 pub(crate) fn send_file_transfer(
     hub: &PeerHub,
-    peers: &[u64],
+    peer_id: u64,
     id: &str,
+    version: crate::protocol::ClipboardVersion,
     files: &CapturedFiles,
+    cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
-    let result = send_file_transfer_inner(hub, peers, id, files);
+    let result = send_file_transfer_inner(hub, peer_id, id, version, files, cancelled);
     if result.is_err() {
-        let _ = hub.send_to_targets(peers, &WireMessage::TransferAbort { id: id.to_string() });
+        let _ = hub.send_control(peer_id, &WireMessage::TransferAbort { id: id.to_string() });
     }
     result
 }
 
 fn send_file_transfer_inner(
     hub: &PeerHub,
-    peers: &[u64],
+    peer_id: u64,
     id: &str,
+    version: crate::protocol::ClipboardVersion,
     files: &CapturedFiles,
+    cancelled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let entries = files
         .entries
@@ -249,12 +253,14 @@ fn send_file_transfer_inner(
         )
     }
 
-    hub.send_to_targets(
-        peers,
+    hub.send_to(
+        peer_id,
         &WireMessage::TransferStart {
             id: id.to_string(),
+            version,
             entries,
         },
+        cancelled,
     )?;
 
     let mut file_index = 0u32;
@@ -310,14 +316,15 @@ fn send_file_transfer_inner(
                 crate::i18n::localized!(bail, "files.grew_during_transfer", path = source.display())
             }
             hasher.update(&buffer[..length]);
-            hub.send_to_targets(
-                peers,
+            hub.send_to(
+                peer_id,
                 &WireMessage::TransferChunk {
                     id: id.to_string(),
                     file_index,
                     offset,
                     bytes: buffer[..length].to_vec(),
                 },
+                cancelled,
             )?;
             offset = next_offset;
         }
@@ -348,20 +355,25 @@ fn send_file_transfer_inner(
             )
         }
         let sha256: [u8; 32] = hasher.finalize().into();
-        hub.send_to_targets(
-            peers,
+        hub.send_to(
+            peer_id,
             &WireMessage::TransferFileEnd {
                 id: id.to_string(),
                 file_index,
                 sha256,
             },
+            cancelled,
         )?;
         file_index = file_index
             .checked_add(1)
             .context(crate::i18n::tr("files.count_overflow"))?;
     }
 
-    hub.send_to_targets(peers, &WireMessage::TransferEnd { id: id.to_string() })
+    hub.send_to(
+        peer_id,
+        &WireMessage::TransferEnd { id: id.to_string() },
+        cancelled,
+    )
 }
 
 pub(crate) struct IncomingTransfer {
