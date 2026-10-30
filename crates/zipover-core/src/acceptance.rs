@@ -24,7 +24,12 @@ fn lan_round_trip() {
     assert!(store.config.peers.is_empty());
     let listener = TcpListener::bind(options.listen).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let discovery = Discovery::start(&store.config, listener.local_addr().unwrap()).unwrap();
+    let discovery = Discovery::start(
+        &store.config,
+        listener.local_addr().unwrap(),
+        crate::runtime::SharedStatus::default(),
+    )
+    .unwrap();
     let pairing = Pairing::new(store);
     let hub = PeerHub::default();
     let (tx, rx) = mpsc::sync_channel(32);

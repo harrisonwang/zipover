@@ -24,63 +24,42 @@ pub(crate) struct CaptureCache {
     files: Option<(Vec<PathBuf>, Arc<CapturedFiles>)>,
     next_file_validation: Option<Instant>,
     image: Option<CachedImage>,
-    last_file_error: Option<String>,
 }
 
 pub(crate) fn capture_payload(
     clipboard: &mut Clipboard,
     cache: &mut CaptureCache,
-) -> Result<CapturedPayload> {
-    if let Ok(paths) = clipboard.get().file_list()
-        && !paths.is_empty()
-    {
-        let cached = cache
-            .files
-            .as_ref()
-            .filter(|(cached_paths, _)| *cached_paths == paths)
-            .map(|(_, files)| files.clone());
-        if let Some(files) = cached
+) -> Result<Option<CapturedPayload>> {
+    let paths = match clipboard.get().file_list() {
+        Ok(paths) => paths,
+        Err(arboard::Error::ContentNotAvailable) => Vec::new(),
+        Err(error) => return Err(error).context(crate::i18n::tr("clipboard.read_files_failed")),
+    };
+    if !paths.is_empty() {
+        if let Some((cached_paths, files)) = &cache.files
+            && *cached_paths == paths
             && cache
                 .next_file_validation
                 .is_some_and(|deadline| deadline > Instant::now())
         {
-            return Ok(CapturedPayload::Files(files));
+            return Ok(Some(CapturedPayload::Files(files.clone())));
         }
-
-        match capture_files(&paths) {
-            Ok(files) => {
-                let files = Arc::new(files);
-                cache.files = Some((paths, files.clone()));
-                cache.next_file_validation = Some(Instant::now() + FILE_CACHE_VALIDATION_INTERVAL);
-                cache.last_file_error = None;
-                return Ok(CapturedPayload::Files(files));
-            }
-            Err(error) => {
-                let message = format!("{error:#}");
-                if cache.last_file_error.as_deref() != Some(&message) {
-                    crate::i18n::localized!(
-                        eprintln,
-                        "clipboard.invalid_file_list",
-                        message = message
-                    );
-                    cache.last_file_error = Some(message);
-                }
-            }
-        }
+        let files = Arc::new(capture_files(&paths)?);
+        cache.files = Some((paths, files.clone()));
+        cache.next_file_validation = Some(Instant::now() + FILE_CACHE_VALIDATION_INTERVAL);
+        return Ok(Some(CapturedPayload::Files(files)));
     }
     cache.files = None;
     cache.next_file_validation = None;
 
     if let Some(image) = capture_image(clipboard, &mut cache.image)? {
-        return Ok(CapturedPayload::Image(image));
+        return Ok(Some(CapturedPayload::Image(image)));
     }
-    if let Ok(text) = clipboard.get_text()
-        && !text.is_empty()
-    {
-        cache.last_file_error = None;
-        return Ok(CapturedPayload::Text(text));
+    match clipboard.get_text() {
+        Ok(text) if !text.is_empty() => Ok(Some(CapturedPayload::Text(text))),
+        Ok(_) | Err(arboard::Error::ContentNotAvailable) => Ok(None),
+        Err(error) => Err(error).context(crate::i18n::tr("clipboard.read_text_failed")),
     }
-    crate::i18n::localized!(bail, "clipboard.unsupported_content")
 }
 
 pub(crate) fn set_file_list(clipboard: &mut Clipboard, paths: &[PathBuf]) -> Result<()> {
@@ -122,10 +101,10 @@ fn normalize_copy_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     paths
         .into_iter()
         .map(|path| {
-            if !path.exists() {
-                crate::i18n::localized!(bail, "clipboard.path_missing", path = path.display());
-            }
-            if !path.is_file() && !path.is_dir() {
+            let metadata = std::fs::metadata(&path).with_context(|| {
+                crate::i18n::localized!(format, "clipboard.read_path_failed", path = path.display())
+            })?;
+            if !metadata.is_file() && !metadata.is_dir() {
                 crate::i18n::localized!(bail, "clipboard.unsupported_path", path = path.display());
             }
             path.canonicalize().with_context(|| {

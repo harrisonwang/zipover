@@ -11,7 +11,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     io,
     net::{SocketAddr, TcpListener},
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread,
 };
 
@@ -48,12 +48,23 @@ pub struct Snapshot {
     pub joining: Option<JoinProgress>,
     pub paired: bool,
     pub error: Option<String>,
+    pub discovery_error: Option<String>,
+    pub sync_error: Option<String>,
 }
+
+#[derive(Default)]
+pub(crate) struct RuntimeStatus {
+    pub discovery_error: Option<String>,
+    pub sync_error: Option<String>,
+}
+
+pub(crate) type SharedStatus = Arc<Mutex<RuntimeStatus>>;
 
 pub struct SyncRuntime {
     local_addr: SocketAddr,
     hub: PeerHub,
     pairing: SharedPairing,
+    status: SharedStatus,
     clipboard_thread: Option<thread::JoinHandle<Result<()>>>,
     network_thread: Option<thread::JoinHandle<()>>,
 }
@@ -67,10 +78,17 @@ impl SyncRuntime {
         })?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
-        let discovery = match Discovery::start(&store.config, local_addr) {
+        let status = SharedStatus::default();
+        let discovery = match Discovery::start(&store.config, local_addr, status.clone()) {
             Ok(discovery) => Some(discovery),
             Err(error) => {
                 crate::i18n::localized!(eprintln, "runtime.discovery_unavailable", error = error : {:#});
+                status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .discovery_error = Some(
+                    crate::i18n::localized!(format, "runtime.discovery_unavailable", error = error : {:#}),
+                );
                 None
             }
         };
@@ -92,14 +110,16 @@ impl SyncRuntime {
         }));
         let clipboard_thread = {
             let hub = hub.clone();
+            let status = status.clone();
             Some(thread::spawn(move || {
-                clipboard_loop(clipboard, hub, rx, local_id)
+                clipboard_loop(clipboard, hub, rx, local_id, status)
             }))
         };
         Ok(Self {
             local_addr,
             hub,
             pairing,
+            status,
             clipboard_thread,
             network_thread,
         })
@@ -110,6 +130,8 @@ impl SyncRuntime {
     }
 
     pub fn snapshot(&self) -> Snapshot {
+        // 枚举网卡属于系统查询，不占用配对与配置的共享锁。
+        let pairing_addresses = crate::address::pairing_addresses(self.local_addr);
         let pairing = self.pairing.lock().unwrap_or_else(|error| {
             panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
         });
@@ -136,9 +158,13 @@ impl SyncRuntime {
             })
             .collect();
         nearby.sort_by_key(|peer| peer.id);
+        let status = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Snapshot {
             listen_addr: Some(self.local_addr),
-            pairing_addresses: crate::address::pairing_addresses(self.local_addr),
+            pairing_addresses,
             devices,
             nearby,
             code: pairing.invitation_code().map(str::to_owned),
@@ -146,6 +172,8 @@ impl SyncRuntime {
             joining: pairing.join_progress(),
             paired: pairing.result.is_some(),
             error: pairing.error.clone(),
+            discovery_error: status.discovery_error.clone(),
+            sync_error: status.sync_error.clone(),
         }
     }
 

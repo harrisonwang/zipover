@@ -15,10 +15,15 @@ pub(crate) struct Discovery {
     monitor: Receiver<DaemonEvent>,
     address: SocketAddr,
     inviting: bool,
+    status: crate::runtime::SharedStatus,
 }
 
 impl Discovery {
-    pub fn start(config: &DeviceConfig, address: SocketAddr) -> Result<Self> {
+    pub fn start(
+        config: &DeviceConfig,
+        address: SocketAddr,
+        status: crate::runtime::SharedStatus,
+    ) -> Result<Self> {
         let daemon = ServiceDaemon::new()?;
         let monitor = daemon.monitor()?;
         let service = Self::service(config, address, false)?;
@@ -30,6 +35,7 @@ impl Discovery {
             monitor,
             address,
             inviting: false,
+            status,
         })
     }
 
@@ -76,14 +82,14 @@ impl Discovery {
                         self.inviting = inviting;
                     }
                     Err(error) => {
-                        crate::i18n::localized!(eprintln, "discovery.failed", error = error)
+                        self.report_error(error);
                     }
                 }
             }
         }
         for event in self.monitor.try_iter() {
             if let DaemonEvent::Error(error) = event {
-                crate::i18n::localized!(eprintln, "discovery.failed", error = error);
+                self.report_error(error);
             }
         }
         for event in self.receiver.try_iter() {
@@ -112,6 +118,10 @@ impl Discovery {
                     if addresses.is_empty() {
                         continue;
                     }
+                    self.status
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .discovery_error = None;
                     let peer = DiscoveredPeer {
                         id,
                         name: info
@@ -135,6 +145,15 @@ impl Discovery {
                 _ => {}
             }
         }
+    }
+
+    fn report_error(&self, error: impl std::fmt::Display) {
+        let message = crate::i18n::localized!(format, "discovery.failed", error = error);
+        eprintln!("{message}");
+        self.status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .discovery_error = Some(message);
     }
 }
 

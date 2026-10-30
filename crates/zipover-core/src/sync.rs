@@ -3,6 +3,7 @@ use crate::{
     files::{IncomingTransfer, cleanup_cache, files_summary, send_file_transfer},
     image::{IncomingImage, send_image_transfer},
     protocol::{ClipboardVersion, DeliveryStatus, WireMessage},
+    runtime::SharedStatus,
     transport::{IncomingEvent, PeerHub},
 };
 #[cfg(test)]
@@ -91,6 +92,7 @@ struct SyncState {
     applied_version: Option<ClipboardVersion>,
     send_retries: HashMap<u64, SendRetry>,
     last_capture_error: Option<String>,
+    last_receive_error: Option<String>,
     last_send_error: Option<String>,
     receipts: RecentDeliveries,
     active_transfers: HashMap<SessionKey, ActiveTransfer>,
@@ -109,6 +111,7 @@ impl SyncState {
             applied_version: None,
             send_retries: HashMap::new(),
             last_capture_error: None,
+            last_receive_error: None,
             last_send_error: None,
             receipts: RecentDeliveries::default(),
             active_transfers: HashMap::new(),
@@ -132,6 +135,7 @@ impl SyncState {
             self.sent_peers.clear();
             self.send_retries.clear();
             self.last_send_error = None;
+            self.last_receive_error = None;
         }
     }
 
@@ -163,10 +167,12 @@ impl SyncState {
         }
         match result {
             Ok(()) => {
-                self.last_send_error = None;
                 for peer_id in targets.iter().filter(|id| connected.contains(id)) {
                     self.sent_peers.insert(*peer_id);
                     self.send_retries.remove(peer_id);
+                }
+                if self.send_retries.is_empty() {
+                    self.last_send_error = None;
                 }
             }
             Err(error) => {
@@ -200,6 +206,7 @@ pub(crate) fn clipboard_loop(
     hub: PeerHub,
     incoming: Receiver<IncomingEvent>,
     local_id: crate::config::DeviceId,
+    status: SharedStatus,
 ) -> Result<()> {
     let mut state = SyncState::new(local_id);
     let mut cache = CaptureCache::default();
@@ -234,7 +241,7 @@ pub(crate) fn clipboard_loop(
                             | WireMessage::ImageStart { .. }
                             | WireMessage::TransferEnd { .. }
                             | WireMessage::ImageEnd { .. }
-                    ) && let Ok(payload) = capture_payload(&mut clipboard, &mut cache)
+                    ) && let Ok(Some(payload)) = capture_payload(&mut clipboard, &mut cache)
                     {
                         state.observe_fingerprint(captured_fingerprint(&payload));
                         discard_obsolete_transfers(&mut state, &hub);
@@ -249,7 +256,9 @@ pub(crate) fn clipboard_loop(
                         state.active_images.remove(&key);
                         state.receipts.insert(&id, DeliveryStatus::Rejected);
                         reply(&hub, peer_id, &id, DeliveryStatus::Rejected);
-                        eprintln!("{error:#}");
+                        let message = format!("{error:#}");
+                        eprintln!("{message}");
+                        state.last_receive_error = Some(message);
                     }
                 } else if let Err(error) =
                     handle_incoming_event(event, &mut clipboard, &mut state, &hub)
@@ -281,7 +290,7 @@ pub(crate) fn clipboard_loop(
             }
             if !peers.is_empty() {
                 match capture_payload(&mut clipboard, &mut cache) {
-                    Ok(payload) => {
+                    Ok(Some(payload)) => {
                         state.last_capture_error = None;
                         state.observe_fingerprint(captured_fingerprint(&payload));
                         discard_obsolete_transfers(&mut state, &hub);
@@ -331,6 +340,9 @@ pub(crate) fn clipboard_loop(
                             }
                         }
                     }
+                    Ok(None) => {
+                        state.last_capture_error = None;
+                    }
                     Err(error) => {
                         let message = format!("{error:#}");
                         if state.last_capture_error.as_deref() != Some(&message) {
@@ -349,6 +361,15 @@ pub(crate) fn clipboard_loop(
                     send.cancelled.store(true, Ordering::Release);
                 }
             }
+            status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sync_error = state
+                .last_receive_error
+                .as_ref()
+                .or(state.last_send_error.as_ref())
+                .or(state.last_capture_error.as_ref())
+                .cloned();
             thread::sleep(POLL_INTERVAL);
         };
         for send in outgoing.values() {
@@ -771,6 +792,8 @@ fn mark_remote_applied(
     version: ClipboardVersion,
 ) {
     state.last_fingerprint = Some(fingerprint);
+    state.last_receive_error = None;
+    state.last_capture_error = None;
     state.applied_version = Some(version);
     state.send_retries.clear();
     state.sent_peers.insert(peer_id);
