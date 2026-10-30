@@ -1071,12 +1071,7 @@ fn maintain_cache_locked(
 }
 
 fn remove_cached_directory(path: &Path) -> std::io::Result<()> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => return Ok(()),
-        #[cfg(unix)]
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
-        Err(error) => return Err(error),
-    }
+    let result = fs::remove_dir_all(path);
     // 源目录可能为只读或不可遍历；删除缓存时恢复目录的用户权限，不跟随链接。
     #[cfg(unix)]
     fn unlock_directories(path: &Path) -> std::io::Result<()> {
@@ -1090,10 +1085,14 @@ fn remove_cached_directory(path: &Path) -> std::io::Result<()> {
         Ok(())
     }
     #[cfg(unix)]
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
     {
         unlock_directories(path)?;
-        fs::remove_dir_all(path)
+        return fs::remove_dir_all(path);
     }
+    result
 }
 
 fn modified_nanos(metadata: &fs::Metadata) -> u128 {
