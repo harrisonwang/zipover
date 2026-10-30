@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 zipover-core.workspace = true
 hex.workspace = true
+rust-i18n.workspace = true
 
 [build-dependencies]
 embed-resource = "3.0.11"

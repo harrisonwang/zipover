@@ -172,24 +172,17 @@ impl Pairing {
             .iter()
             .find(|peer| peer.id == id)
             .map(|peer| peer.key)
-            .context(crate::i18n::text(
-                "未配对的设备",
-                "The device is not paired",
-            ))
+            .context(crate::i18n::tr("pairing.not_paired"))
     }
 
     pub(crate) fn begin_incoming(&mut self) -> Result<PairAttempt> {
         self.expire();
-        let invitation = self.invitation.as_mut().context(crate::i18n::text(
-            "配对码已失效，请重新打开配对窗口",
-            "The pairing code is no longer valid. Open the pairing window again.",
-        ))?;
+        let invitation = self
+            .invitation
+            .as_mut()
+            .context(crate::i18n::tr("pairing.invitation_expired"))?;
         if invitation.attempts >= MAX_ATTEMPTS {
-            crate::i18n::localized!(
-                bail,
-                "尝试次数过多，请重新生成配对码",
-                "Too many attempts. Generate a new pairing code."
-            )
+            crate::i18n::localized!(bail, "pairing.too_many_attempts")
         }
         invitation.attempts += 1;
         Ok(invitation.attempt.clone())
@@ -209,11 +202,7 @@ impl Pairing {
         if !current
             .is_some_and(|a| a.generation == attempt.generation && a.expires > Instant::now())
         {
-            crate::i18n::localized!(
-                bail,
-                "配对已取消、已被使用或已过期",
-                "Pairing was canceled, already used, or expired"
-            )
+            crate::i18n::localized!(bail, "pairing.attempt_expired")
         }
         self.store.trust(peer)?;
         match role {
@@ -231,13 +220,7 @@ impl Pairing {
                 .is_some_and(|r| r.attempt.generation == attempt.generation)
             {
                 self.request = None;
-                self.error = Some(
-                    crate::i18n::text(
-                        "连接失败，请核对配对码后重试",
-                        "Unable to connect. Check the pairing code and try again.",
-                    )
-                    .into(),
-                );
+                self.error = Some(crate::i18n::tr("pairing.connection_failed").into());
             }
         } else if self.invitation.as_ref().is_some_and(|i| {
             i.attempt.generation == attempt.generation && i.attempts >= MAX_ATTEMPTS
@@ -247,13 +230,7 @@ impl Pairing {
             // action for a recoverable pairing failure.
             if self.start_invitation().is_err() {
                 self.invitation = None;
-                self.error = Some(
-                    crate::i18n::text(
-                        "无法生成新的配对码",
-                        "Unable to generate a new pairing code",
-                    )
-                    .into(),
-                );
+                self.error = Some(crate::i18n::tr("pairing.generate_code_failed").into());
             }
         }
     }
@@ -270,13 +247,7 @@ impl Pairing {
             // another device can continue pairing without reopening the panel.
             if self.start_invitation().is_err() {
                 self.invitation = None;
-                self.error = Some(
-                    crate::i18n::text(
-                        "无法生成新的配对码",
-                        "Unable to generate a new pairing code",
-                    )
-                    .into(),
-                );
+                self.error = Some(crate::i18n::tr("pairing.generate_code_failed").into());
             }
         } else if self
             .request
@@ -288,11 +259,14 @@ impl Pairing {
                 .as_ref()
                 .is_some_and(|request| request.endpoint.is_some());
             self.request = None;
-            self.error = Some(if manual {
-                crate::i18n::text("无法连接设备，请核对 IP 地址、端口和配对码后重试", "Unable to connect. Check the IP address, port and pairing code, then try again.")
-            } else {
-                crate::i18n::text("未找到待配对设备，请确认对方正显示配对码且处于同一局域网", "No device found. Make sure the other computer shows its pairing code and is on the same local network.")
-            }.into());
+            self.error = Some(
+                if manual {
+                    crate::i18n::tr("pairing.manual_connection_failed")
+                } else {
+                    crate::i18n::tr("pairing.device_not_found")
+                }
+                .into(),
+            );
         } else if self
             .request
             .as_ref()
@@ -301,13 +275,7 @@ impl Pairing {
             // A joining device has no new code to display; return it to the
             // input state and let the user enter the inviter's current code.
             self.request = None;
-            self.error = Some(
-                crate::i18n::text(
-                    "配对码已过期，请重新输入",
-                    "The pairing code expired. Enter the current code.",
-                )
-                .into(),
-            );
+            self.error = Some(crate::i18n::tr("pairing.code_expired").into());
         }
     }
 }
@@ -315,11 +283,7 @@ impl Pairing {
 fn parse_code(code: &str) -> Result<String> {
     let code: String = code.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     if code.len() != 6 || !code.bytes().all(|c| c.is_ascii_digit()) {
-        crate::i18n::localized!(
-            bail,
-            "请输入 6 位数字配对码",
-            "Enter a 6-digit pairing code"
-        )
+        crate::i18n::localized!(bail, "pairing.invalid_code")
     }
     Ok(code)
 }
@@ -475,10 +439,7 @@ mod tests {
         assert!(a.request.is_none());
         assert_eq!(
             a.error.as_deref(),
-            Some(crate::i18n::text(
-                "配对码已过期，请重新输入",
-                "The pairing code expired. Enter the current code."
-            ))
+            Some(crate::i18n::tr("pairing.code_expired").as_ref())
         );
     }
 
@@ -495,7 +456,7 @@ mod tests {
             a.error
                 .as_deref()
                 .unwrap()
-                .starts_with(crate::i18n::text("未找到待配对设备", "No device found."))
+                .starts_with(crate::i18n::tr("pairing.device_not_found").as_ref())
         );
 
         a.join("123456", None).unwrap();
@@ -531,7 +492,7 @@ mod tests {
             a.error
                 .as_deref()
                 .unwrap()
-                .starts_with(crate::i18n::text("无法连接设备", "Unable to connect."))
+                .starts_with(crate::i18n::tr("pairing.manual_connection_failed").as_ref())
         );
         assert!(a.store.config.peers.is_empty());
     }

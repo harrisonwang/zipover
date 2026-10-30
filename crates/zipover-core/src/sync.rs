@@ -119,8 +119,7 @@ pub(crate) fn clipboard_loop(
                 let result = job.join().unwrap_or_else(|_| {
                     Err(crate::i18n::localized!(
                         anyhow,
-                        "剪贴板发送线程异常退出",
-                        "The clipboard sending thread stopped unexpectedly"
+                        "sync.sending_thread_stopped"
                     ))
                 });
                 match result {
@@ -130,8 +129,8 @@ pub(crate) fn clipboard_loop(
                         if state.last_send_error.as_deref() != Some(&message) {
                             crate::i18n::localized!(
                                 eprintln,
-                                "剪贴板同步：发送失败：{message}",
-                                "Clipboard sync: unable to send: {message}"
+                                "sync.send_failed",
+                                message = message
                             );
                         }
                         state.last_send_error = Some(message);
@@ -160,11 +159,7 @@ pub(crate) fn clipboard_loop(
                         if !targets.is_empty() {
                             let id = state.next_id();
                             let summary = captured_summary(&payload);
-                            crate::i18n::localized!(
-                                eprintln,
-                                "剪贴板同步：正在发送 {summary}",
-                                "Clipboard sync: sending {summary}"
-                            );
+                            crate::i18n::localized!(eprintln, "sync.sending", summary = summary);
                             state.sent_peers.extend(&targets);
                             state.last_fingerprint = Some(fingerprint);
                             // Keep receiving while bounded outgoing queues apply backpressure.
@@ -179,8 +174,8 @@ pub(crate) fn clipboard_loop(
                         if state.last_capture_error.as_deref() != Some(&message) {
                             crate::i18n::localized!(
                                 eprintln,
-                                "剪贴板同步：读取本地剪贴板失败：{message}",
-                                "Clipboard sync: unable to read the local clipboard: {message}"
+                                "sync.capture_failed",
+                                message = message
                             );
                             state.last_capture_error = Some(message);
                         }
@@ -208,11 +203,7 @@ fn send_payload(hub: &PeerHub, peers: &[u64], id: &str, payload: CapturedPayload
         CapturedPayload::Image(image) => send_image_transfer(hub, peers, id, &image),
         CapturedPayload::Files(files) => {
             if files.internal {
-                crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：忽略内部临时路径，避免同步回环",
-                    "Clipboard sync: ignoring internal temporary paths to prevent a sync loop"
-                );
+                crate::i18n::localized!(eprintln, "sync.ignored_internal_paths");
                 return Ok(());
             }
             send_file_transfer(hub, peers, id, &files)
@@ -237,26 +228,16 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
             }
             let fingerprint = fingerprint(&payload);
             let summary = payload_summary(&payload);
-            crate::i18n::localized!(
-                eprintln,
-                "剪贴板同步：收到 {summary}",
-                "Clipboard sync: received {summary}"
-            );
+            crate::i18n::localized!(eprintln, "sync.received", summary = summary);
             match apply_payload(clipboard, &payload) {
                 Ok(()) => {
                     state.completed.insert(&id);
                     mark_remote_applied(state, fingerprint, peer_id);
-                    crate::i18n::localized!(
-                        eprintln,
-                        "剪贴板同步：已应用 {summary}",
-                        "Clipboard sync: applied {summary}"
-                    );
+                    crate::i18n::localized!(eprintln, "sync.applied", summary = summary);
                 }
-                Err(error) => crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：应用远端剪贴板失败：{error:#}",
-                    "Clipboard sync: unable to apply the remote clipboard: {error:#}"
-                ),
+                Err(error) => {
+                    crate::i18n::localized!(eprintln, "sync.apply_failed", error = error : {:#})
+                }
             }
         }
         WireMessage::TransferStart { id, entries } => {
@@ -266,22 +247,14 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
             let key = SessionKey::new(peer_id, id.clone());
             state.active_transfers.remove(&key);
             if state.active_transfers.len() >= MAX_ACTIVE_TRANSFERS {
-                crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：活动文件传输数量已达上限",
-                    "Clipboard sync: too many active file transfers"
-                );
+                crate::i18n::localized!(eprintln, "sync.too_many_file_transfers");
                 return;
             }
             let Some(transfer_size) = entries
                 .iter()
                 .try_fold(0u64, |total, entry| total.checked_add(entry.size))
             else {
-                crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：活动文件传输大小溢出",
-                    "Clipboard sync: active file transfer size overflow"
-                );
+                crate::i18n::localized!(eprintln, "sync.file_size_overflow");
                 return;
             };
             let active_size = state
@@ -290,11 +263,7 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
                 .map(|active| active.size)
                 .sum::<u64>();
             if active_size.saturating_add(transfer_size) > MAX_ACTIVE_TRANSFER_BYTES {
-                crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：活动文件传输大小已达上限",
-                    "Clipboard sync: active file transfers exceed the size limit"
-                );
+                crate::i18n::localized!(eprintln, "sync.file_size_limit");
                 return;
             }
             let cache_scope = format!("{}-{peer_id}", state.origin);
@@ -302,9 +271,8 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
                 Ok(transfer) => {
                     crate::i18n::localized!(
                         eprintln,
-                        "剪贴板同步：开始接收 {}",
-                        "Clipboard sync: receiving {}",
-                        transfer.summary()
+                        "sync.receiving_files",
+                        summary = transfer.summary()
                     );
                     state.active_transfers.insert(
                         key,
@@ -315,11 +283,9 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
                         },
                     );
                 }
-                Err(error) => crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：拒绝文件传输：{error:#}",
-                    "Clipboard sync: file transfer rejected: {error:#}"
-                ),
+                Err(error) => {
+                    crate::i18n::localized!(eprintln, "sync.file_transfer_rejected", error = error : {:#})
+                }
             }
         }
         WireMessage::TransferChunk {
@@ -337,11 +303,7 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
             };
             active.last_activity = Instant::now();
             if let Err(error) = active.transfer.accept_chunk(file_index, offset, &bytes) {
-                crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：接收文件分块失败：{error:#}",
-                    "Clipboard sync: unable to receive file chunk: {error:#}"
-                );
+                crate::i18n::localized!(eprintln, "sync.file_chunk_failed", error = error : {:#});
                 state.active_transfers.remove(&key);
             }
         }
@@ -359,11 +321,7 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
             };
             active.last_activity = Instant::now();
             if let Err(error) = active.transfer.finish_file(file_index, sha256) {
-                crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：文件校验失败：{error:#}",
-                    "Clipboard sync: file verification failed: {error:#}"
-                );
+                crate::i18n::localized!(eprintln, "sync.file_verification_failed", error = error : {:#});
                 state.active_transfers.remove(&key);
             }
         }
@@ -377,11 +335,7 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
                 return;
             }
             let Some(active) = state.active_transfers.remove(&key) else {
-                crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：找不到要结束的文件传输 {id}",
-                    "Clipboard sync: file transfer {id} was not found"
-                );
+                crate::i18n::localized!(eprintln, "sync.file_transfer_missing", id = id);
                 return;
             };
             let summary = active.transfer.summary();
@@ -390,37 +344,23 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
                     Ok(()) => {
                         state.completed.insert(&id);
                         mark_remote_applied(state, finished.fingerprint, peer_id);
-                        crate::i18n::localized!(
-                            eprintln,
-                            "剪贴板同步：已完成 {summary}",
-                            "Clipboard sync: completed {summary}"
-                        );
+                        crate::i18n::localized!(eprintln, "sync.completed", summary = summary);
                     }
                     Err(error) => {
-                        crate::i18n::localized!(
-                            eprintln,
-                            "剪贴板同步：写入接收文件列表失败：{error:#}",
-                            "Clipboard sync: unable to write the received file list: {error:#}"
-                        );
+                        crate::i18n::localized!(eprintln, "sync.write_file_list_failed", error = error : {:#});
                         finished.cleanup();
                     }
                 },
-                Err(error) => crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：完成文件传输失败：{error:#}",
-                    "Clipboard sync: unable to complete file transfer: {error:#}"
-                ),
+                Err(error) => {
+                    crate::i18n::localized!(eprintln, "sync.file_completion_failed", error = error : {:#})
+                }
             }
         }
         WireMessage::TransferAbort { id } => {
             let key = SessionKey::new(peer_id, id);
             state.active_transfers.remove(&key);
             state.active_images.remove(&key);
-            crate::i18n::localized!(
-                eprintln,
-                "剪贴板同步：远端中止传输",
-                "Clipboard sync: the remote device aborted the transfer"
-            );
+            crate::i18n::localized!(eprintln, "sync.remote_aborted");
         }
         WireMessage::ImageStart {
             id,
@@ -434,11 +374,7 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
             }
             let key = SessionKey::new(peer_id, id);
             if state.active_images.len() >= MAX_ACTIVE_IMAGES {
-                crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：活动图片传输数量已达上限",
-                    "Clipboard sync: too many active image transfers"
-                );
+                crate::i18n::localized!(eprintln, "sync.too_many_image_transfers");
                 return;
             }
             let active_size = state
@@ -447,20 +383,17 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
                 .map(|active| active.size)
                 .sum::<u64>();
             if active_size.saturating_add(size) > MAX_ACTIVE_IMAGE_BYTES {
-                crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：活动图片传输资源已达上限",
-                    "Clipboard sync: active image transfers exceed the resource limit"
-                );
+                crate::i18n::localized!(eprintln, "sync.image_resource_limit");
                 return;
             }
             match IncomingImage::start(fingerprint, width, height, size) {
                 Ok(image) => {
                     crate::i18n::localized!(
                         eprintln,
-                        "剪贴板同步：开始接收图片 {width}x{height}（{}）",
-                        "Clipboard sync: receiving image {width}x{height} ({})",
-                        format_bytes(size)
+                        "sync.receiving_image",
+                        width = width,
+                        height = height,
+                        size = format_bytes(size)
                     );
                     state.active_images.insert(
                         key,
@@ -471,11 +404,9 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
                         },
                     );
                 }
-                Err(error) => crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：拒绝图片传输：{error:#}",
-                    "Clipboard sync: image transfer rejected: {error:#}"
-                ),
+                Err(error) => {
+                    crate::i18n::localized!(eprintln, "sync.image_transfer_rejected", error = error : {:#})
+                }
             }
         }
         WireMessage::ImageChunk { id, offset, bytes } => {
@@ -488,11 +419,7 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
             };
             active.last_activity = Instant::now();
             if let Err(error) = active.image.accept_chunk(offset, &bytes) {
-                crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：接收图片分块失败：{error:#}",
-                    "Clipboard sync: unable to receive image chunk: {error:#}"
-                );
+                crate::i18n::localized!(eprintln, "sync.image_chunk_failed", error = error : {:#});
                 state.active_images.remove(&key);
             }
         }
@@ -506,11 +433,7 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
                 return;
             }
             let Some(active) = state.active_images.remove(&key) else {
-                crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：找不到要结束的图片传输 {id}",
-                    "Clipboard sync: image transfer {id} was not found"
-                );
+                crate::i18n::localized!(eprintln, "sync.image_transfer_missing", id = id);
                 return;
             };
             match active.image.finish(sha256) {
@@ -518,23 +441,15 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
                     Ok(()) => {
                         state.completed.insert(&id);
                         mark_remote_applied(state, fingerprint, peer_id);
-                        crate::i18n::localized!(
-                            eprintln,
-                            "剪贴板同步：已应用图片",
-                            "Clipboard sync: applied image"
-                        );
+                        crate::i18n::localized!(eprintln, "sync.image_applied");
                     }
-                    Err(error) => crate::i18n::localized!(
-                        eprintln,
-                        "剪贴板同步：应用远端图片失败：{error:#}",
-                        "Clipboard sync: unable to apply the remote image: {error:#}"
-                    ),
+                    Err(error) => {
+                        crate::i18n::localized!(eprintln, "sync.apply_image_failed", error = error : {:#})
+                    }
                 },
-                Err(error) => crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：完成图片传输失败：{error:#}",
-                    "Clipboard sync: unable to complete image transfer: {error:#}"
-                ),
+                Err(error) => {
+                    crate::i18n::localized!(eprintln, "sync.image_completion_failed", error = error : {:#})
+                }
             }
         }
     }
@@ -580,9 +495,10 @@ fn payload_summary(payload: &ClipboardPayload) -> String {
         } => {
             crate::i18n::localized!(
                 format,
-                "图片 {width}x{height}（{}）",
-                "Image {width}x{height} ({})",
-                format_bytes(bytes.len() as u64)
+                "image.summary",
+                width = width,
+                height = height,
+                size = format_bytes(bytes.len() as u64)
             )
         }
     }
@@ -591,9 +507,8 @@ fn payload_summary(payload: &ClipboardPayload) -> String {
 fn text_summary(text: &str) -> String {
     crate::i18n::localized!(
         format,
-        "文本（{}）",
-        "Text ({})",
-        format_bytes(text.len() as u64)
+        "sync.text_summary",
+        size = format_bytes(text.len() as u64)
     )
 }
 

@@ -66,13 +66,10 @@ impl PeerHub {
         if !alive.load(Ordering::Relaxed) {
             return Ok(false);
         }
-        let mut peers = self.peers.lock().map_err(|_| {
-            crate::i18n::localized!(
-                anyhow,
-                "设备列表锁已损坏",
-                "The device list lock is poisoned"
-            )
-        })?;
+        let mut peers = self
+            .peers
+            .lock()
+            .map_err(|_| crate::i18n::localized!(anyhow, "transport.lock_poisoned"))?;
         peers.retain(|peer| peer.alive.load(Ordering::Relaxed));
         if self.is_shutdown()
             || peers.len() >= MAX_PEERS
@@ -91,13 +88,10 @@ impl PeerHub {
     }
 
     pub(crate) fn active_peer_ids(&self) -> Result<Vec<u64>> {
-        let mut peers = self.peers.lock().map_err(|_| {
-            crate::i18n::localized!(
-                anyhow,
-                "设备列表锁已损坏",
-                "The device list lock is poisoned"
-            )
-        })?;
+        let mut peers = self
+            .peers
+            .lock()
+            .map_err(|_| crate::i18n::localized!(anyhow, "transport.lock_poisoned"))?;
         peers.retain(|peer| peer.alive.load(Ordering::Relaxed));
         Ok(peers.iter().map(|peer| peer.peer_id).collect())
     }
@@ -158,30 +152,24 @@ impl PeerHub {
     }
 
     fn remove(&self, peer_id: u64) -> Result<()> {
-        let mut peers = self.peers.lock().map_err(|_| {
-            crate::i18n::localized!(
-                anyhow,
-                "设备列表锁已损坏",
-                "The device list lock is poisoned"
-            )
-        })?;
+        let mut peers = self
+            .peers
+            .lock()
+            .map_err(|_| crate::i18n::localized!(anyhow, "transport.lock_poisoned"))?;
         peers.retain(|peer| peer.peer_id != peer_id);
         Ok(())
     }
 
     pub(crate) fn send_to_targets(&self, peer_ids: &[u64], message: &WireMessage) -> Result<()> {
         if peer_ids.is_empty() {
-            crate::i18n::localized!(bail, "当前没有已连接的设备", "No devices are connected");
+            crate::i18n::localized!(bail, "transport.no_connected_devices");
         }
         let frame = encode_message(message)?;
         let targets = {
-            let peers = self.peers.lock().map_err(|_| {
-                crate::i18n::localized!(
-                    anyhow,
-                    "设备列表锁已损坏",
-                    "The device list lock is poisoned"
-                )
-            })?;
+            let peers = self
+                .peers
+                .lock()
+                .map_err(|_| crate::i18n::localized!(anyhow, "transport.lock_poisoned"))?;
             peer_ids
                 .iter()
                 .filter_map(|peer_id| {
@@ -204,32 +192,25 @@ impl PeerHub {
                 }
             }
         }
-        let mut peers = self.peers.lock().map_err(|_| {
-            crate::i18n::localized!(
-                anyhow,
-                "设备列表锁已损坏",
-                "The device list lock is poisoned"
-            )
-        })?;
+        let mut peers = self
+            .peers
+            .lock()
+            .map_err(|_| crate::i18n::localized!(anyhow, "transport.lock_poisoned"))?;
         peers.retain(|peer| peer.alive.load(Ordering::Relaxed));
         if !sent {
-            crate::i18n::localized!(bail, "设备连接已关闭", "The device connection is closed");
+            crate::i18n::localized!(bail, "transport.connection_closed");
         }
         Ok(())
     }
 }
 
 fn encode_message(message: &WireMessage) -> Result<Arc<[u8]>> {
-    let frame = bincode::serialize(message).context(crate::i18n::text(
-        "序列化剪贴板消息失败",
-        "Unable to encode the clipboard message",
-    ))?;
+    let frame = bincode::serialize(message).context(crate::i18n::tr("transport.encode_failed"))?;
     if frame.is_empty() || frame.len() > FRAME_LIMIT {
         crate::i18n::localized!(
             bail,
-            "剪贴板消息过大，无法放入单帧（{}）",
-            "The clipboard message exceeds the frame size limit ({})",
-            format_bytes(frame.len() as u64)
+            "transport.frame_size_limit",
+            size = format_bytes(frame.len() as u64)
         );
     }
     Ok(Arc::from(frame.into_boxed_slice()))
@@ -269,21 +250,15 @@ pub(crate) fn network_loop(
                         [0; 16],
                         thread::spawn(move || {
                             if let Err(error) = establish(stream, None, &hub, &shared, &incoming) {
-                                crate::i18n::localized!(
-                                    eprintln,
-                                    "剪贴板同步：拒绝连接：{error:#}",
-                                    "Clipboard sync: connection rejected: {error:#}"
-                                );
+                                crate::i18n::localized!(eprintln, "transport.connection_rejected", error = error : {:#});
                             }
                         }),
                     ));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：接受连接失败：{error}",
-                    "Clipboard sync: unable to accept connection: {error}"
-                ),
+                Err(error) => {
+                    crate::i18n::localized!(eprintln, "transport.accept_failed", error = error)
+                }
             }
         }
         if Instant::now() >= next_connect {
@@ -352,22 +327,11 @@ pub(crate) fn network_loop(
                     }
                 } else if candidates.len() > 1 {
                     state.request = None;
-                    state.error = Some(
-                        crate::i18n::text(
-                            "发现多台待配对设备，请选择设备后重试",
-                            "Multiple devices are ready to pair. Select a device and try again.",
-                        )
-                        .into(),
-                    );
+                    state.error =
+                        Some(crate::i18n::tr("transport.multiple_pairing_devices").into());
                 } else if already_connected {
                     state.request = None;
-                    state.error = Some(
-                        crate::i18n::text(
-                            "此设备已连接，无需重复配对",
-                            "This device is already connected. Pairing again is not needed.",
-                        )
-                        .into(),
-                    );
+                    state.error = Some(crate::i18n::tr("transport.already_connected").into());
                 }
             } else if state.request.is_none()
                 && let Some(address) = &options.connect
@@ -412,12 +376,7 @@ pub(crate) fn network_loop(
                             }
                         };
                         if let Err(error) = result {
-                            crate::i18n::localized!(
-                                eprintln,
-                                "剪贴板同步：连接 {} 失败：{error:#}",
-                                "Clipboard sync: unable to connect to {}: {error:#}",
-                                hex::encode(id)
-                            );
+                            crate::i18n::localized!(eprintln, "transport.connect_failed", device = hex::encode(id), error = error : {:#});
                             if let ConnectionAuth::Pair(attempt) = &auth {
                                 shared
                                     .lock()
@@ -453,11 +412,7 @@ fn resolve_addresses(addresses: PeerAddresses) -> Result<Vec<SocketAddr>> {
             Err(_) => address
                 .to_socket_addrs()
                 .with_context(|| {
-                    crate::i18n::localized!(
-                        format,
-                        "解析设备地址 {address} 失败",
-                        "Unable to resolve device address {address}"
-                    )
+                    crate::i18n::localized!(format, "transport.resolve_failed", address = address)
                 })?
                 .collect(),
         },
@@ -493,13 +448,8 @@ fn connect_trusted_addresses(
             Err(error) => last_error = Some(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        crate::i18n::localized!(
-            anyhow,
-            "没有可用的设备地址",
-            "No device addresses are available"
-        )
-    }))
+    Err(last_error
+        .unwrap_or_else(|| crate::i18n::localized!(anyhow, "transport.addresses_missing")))
 }
 
 fn connect_addresses(addresses: PeerAddresses) -> Result<TcpStream> {
@@ -510,13 +460,9 @@ fn connect_addresses(addresses: PeerAddresses) -> Result<TcpStream> {
             Err(error) => last_error = Some(error),
         }
     }
-    Err(last_error.map(anyhow::Error::from).unwrap_or_else(|| {
-        crate::i18n::localized!(
-            anyhow,
-            "没有可用的设备地址",
-            "No device addresses are available"
-        )
-    }))
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| crate::i18n::localized!(anyhow, "transport.addresses_missing")))
 }
 
 #[derive(Clone)]
@@ -560,11 +506,7 @@ fn establish(
             || !matches!(preface[37], 0 | 2)
             || (preface[21..37] != local_id && !(pairing_mode && preface[21..37] == [0; 16]))
         {
-            crate::i18n::localized!(
-                bail,
-                "协议或目标设备不匹配，请更新两端 Zipover",
-                "The protocol or target device does not match. Update Zipover on both computers."
-            )
+            crate::i18n::localized!(bail, "transport.protocol_mismatch")
         }
         let id: DeviceId = preface[5..21].try_into().expect("固定长度 ID");
         let mut pairing = shared.lock().expect("配对状态锁已损坏");
@@ -577,11 +519,7 @@ fn establish(
     };
     let result = (|| -> Result<()> {
         if id == local_id {
-            crate::i18n::localized!(
-                bail,
-                "不能连接本机",
-                "You cannot connect this computer to itself"
-            )
+            crate::i18n::localized!(bail, "transport.self_connection")
         }
         let mut context = preface.to_vec();
         let key = match &auth {
@@ -593,19 +531,11 @@ fn establish(
                 if role == ConnectionRole::Initiator {
                     stream.read_exact(&mut responder)?;
                     if id != [0; 16] && id != responder {
-                        crate::i18n::localized!(
-                            bail,
-                            "对端设备不匹配",
-                            "The remote device does not match"
-                        )
+                        crate::i18n::localized!(bail, "transport.remote_mismatch")
                     }
                     id = responder;
                     if id == local_id {
-                        crate::i18n::localized!(
-                            bail,
-                            "不能连接本机",
-                            "You cannot connect this computer to itself"
-                        )
+                        crate::i18n::localized!(bail, "transport.self_connection")
                     }
                 } else {
                     stream.write_all(&responder)?;
@@ -616,11 +546,10 @@ fn establish(
         };
         let (mut writer, mut reader) = crypto::handshake(&mut stream, role, &key, &context)?;
         writer.write_frame(&mut stream, local_name.as_bytes())?;
-        let remote_name = String::from_utf8(reader.read_frame(&mut stream)?).context(
-            crate::i18n::text("设备名不是 UTF-8", "The device name is not valid UTF-8"),
-        )?;
+        let remote_name = String::from_utf8(reader.read_frame(&mut stream)?)
+            .context(crate::i18n::tr("transport.invalid_name_encoding"))?;
         if remote_name.len() > 255 || remote_name.chars().any(char::is_control) {
-            crate::i18n::localized!(bail, "设备名无效", "Invalid device name")
+            crate::i18n::localized!(bail, "transport.invalid_name")
         }
         if let ConnectionAuth::Pair(attempt) = &auth {
             let peer = TrustedPeer {
@@ -637,11 +566,7 @@ fn establish(
             };
             if role == ConnectionRole::Initiator {
                 if reader.read_frame(&mut stream)? != b"paired" {
-                    crate::i18n::localized!(
-                        bail,
-                        "对端未保存配对",
-                        "The remote device did not save the pairing"
-                    )
+                    crate::i18n::localized!(bail, "transport.pairing_not_saved")
                 }
                 shared
                     .lock()
@@ -655,30 +580,26 @@ fn establish(
                     .accept(peer, attempt, role)?;
                 writer.write_frame(&mut stream, b"paired")?;
                 if reader.read_frame(&mut stream)? != b"paired" {
-                    crate::i18n::localized!(
-                        bail,
-                        "对端未保存配对",
-                        "The remote device did not save the pairing"
-                    )
+                    crate::i18n::localized!(bail, "transport.pairing_not_saved")
                 }
             }
             let mut pairing = shared.lock().expect("配对状态锁已损坏");
             pairing.result = Some(crate::i18n::localized!(
                 format,
-                "已配对：{remote_name}",
-                "Paired with {remote_name}"
+                "transport.paired",
+                remote_name = remote_name
             ));
             pairing.error = None;
             crate::i18n::localized!(
                 eprintln,
-                "剪贴板同步：已配对 {remote_name}，以后自动连接",
-                "Clipboard sync: paired with {remote_name}; future connections are automatic"
+                "transport.paired_automatic",
+                remote_name = remote_name
             );
             return Ok(());
         }
         let pairing = shared.lock().expect("配对状态锁已损坏");
         if pairing.key_for(id)? != key {
-            crate::i18n::localized!(bail, "设备已解除配对", "The device is no longer paired")
+            crate::i18n::localized!(bail, "transport.unpaired")
         }
         stream.set_read_timeout(None)?;
         register_connection(
@@ -728,20 +649,16 @@ fn register_connection(
     }
     crate::i18n::localized!(
         eprintln,
-        "剪贴板同步：已加密连接 {name}（{}）",
-        "Clipboard sync: encrypted connection to {name} ({})",
-        hex::encode(device_id)
+        "transport.connected",
+        name = name,
+        device = hex::encode(device_id)
     );
     let writer_alive = alive.clone();
     thread::spawn(move || {
         while writer_alive.load(Ordering::Relaxed) {
             let Ok(frame) = outgoing_rx.recv() else { break };
             if let Err(error) = cipher_writer.write_frame(&mut writer, &frame) {
-                crate::i18n::localized!(
-                    eprintln,
-                    "剪贴板同步：发送数据失败：{error:#}",
-                    "Clipboard sync: unable to send data: {error:#}"
-                );
+                crate::i18n::localized!(eprintln, "transport.send_failed", error = error : {:#});
                 break;
             }
         }
@@ -753,11 +670,7 @@ fn register_connection(
             let message = match bincode::deserialize::<WireMessage>(&frame) {
                 Ok(message) => message,
                 Err(error) => {
-                    crate::i18n::localized!(
-                        eprintln,
-                        "剪贴板同步：无效消息：{error}",
-                        "Clipboard sync: invalid message: {error}"
-                    );
+                    crate::i18n::localized!(eprintln, "transport.invalid_message", error = error);
                     break;
                 }
             };

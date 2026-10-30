@@ -1,6 +1,7 @@
 use std::{env, fs, path::PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-changed=locales");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

@@ -59,8 +59,8 @@ pub(crate) fn capture_payload(
                 if cache.last_file_error.as_deref() != Some(&message) {
                     crate::i18n::localized!(
                         eprintln,
-                        "剪贴板同步：忽略失效的文件列表：{message}",
-                        "Clipboard sync: ignoring an invalid file list: {message}"
+                        "clipboard.invalid_file_list",
+                        message = message
                     );
                     cache.last_file_error = Some(message);
                 }
@@ -79,18 +79,14 @@ pub(crate) fn capture_payload(
         cache.last_file_error = None;
         return Ok(CapturedPayload::Text(text));
     }
-    crate::i18n::localized!(
-        bail,
-        "剪贴板为空或格式暂不支持",
-        "The clipboard is empty or its format is not supported"
-    )
+    crate::i18n::localized!(bail, "clipboard.unsupported_content")
 }
 
 pub(crate) fn apply_payload(clipboard: &mut Clipboard, payload: &ClipboardPayload) -> Result<()> {
     match payload {
         ClipboardPayload::Text(text) => clipboard
             .set_text(text)
-            .context(crate::i18n::text("写入文本失败", "Unable to write text"))?,
+            .context(crate::i18n::tr("clipboard.write_text_failed"))?,
         ClipboardPayload::Image {
             width,
             height,
@@ -102,48 +98,31 @@ pub(crate) fn apply_payload(clipboard: &mut Clipboard, payload: &ClipboardPayloa
 
 pub(crate) fn set_file_list(clipboard: &mut Clipboard, paths: &[PathBuf]) -> Result<()> {
     #[cfg(windows)]
-    clipboard.clear().context(crate::i18n::text(
-        "清空 Windows 剪贴板失败",
-        "Unable to clear the Windows clipboard",
-    ))?;
-    clipboard.set().file_list(paths).context(crate::i18n::text(
-        "写入文件列表失败",
-        "Unable to write the file list",
-    ))?;
+    clipboard
+        .clear()
+        .context(crate::i18n::tr("clipboard.clear_failed"))?;
+    clipboard
+        .set()
+        .file_list(paths)
+        .context(crate::i18n::tr("clipboard.write_files_failed"))?;
     Ok(())
 }
 
 pub fn copy_paths(paths: Vec<PathBuf>) -> Result<()> {
     for path in &paths {
         if !path.exists() {
-            crate::i18n::localized!(
-                bail,
-                "路径不存在：{}",
-                "Path does not exist: {}",
-                path.display()
-            );
+            crate::i18n::localized!(bail, "clipboard.path_missing", path = path.display());
         }
         if !path.is_file() && !path.is_dir() {
-            crate::i18n::localized!(
-                bail,
-                "暂不支持此类路径：{}",
-                "This path type is not supported: {}",
-                path.display()
-            );
+            crate::i18n::localized!(bail, "clipboard.unsupported_path", path = path.display());
         }
     }
 
-    let mut clipboard = Clipboard::new().context(crate::i18n::text(
-        "访问系统剪贴板失败",
-        "Unable to access the system clipboard",
-    ))?;
+    let mut clipboard = Clipboard::new().context(crate::i18n::tr("clipboard.unavailable"))?;
     clipboard
         .set()
         .file_list(&paths)
-        .context(crate::i18n::text(
-            "复制路径到系统剪贴板失败",
-            "Unable to copy paths to the system clipboard",
-        ))?;
+        .context(crate::i18n::tr("clipboard.copy_paths_failed"))?;
 
     Ok(())
 }
