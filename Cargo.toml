@@ -15,8 +15,8 @@ png = "0.17"
 rust-i18n = "4.2.4"
 
 [patch.crates-io]
-# GNOME file clipboard support (#232) was merged after v3.7.0.
-# Remove this patch once a crates.io release includes that change.
+# GNOME 文件剪贴板支持（#232）在 v3.7.0 发布后合入。
+# crates.io 发布包含此改动的版本后移除此补丁。
 arboard = { git = "https://github.com/1Password/arboard.git", rev = "e8ccf3ec25afe3dcdf626459de33b0498ddcc3ca" }
 
 [profile.release]

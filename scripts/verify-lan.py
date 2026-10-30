@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Build and exercise production pairing/discovery/transport on this Mac and an SSH host.
+"""在本机 Mac 和 SSH 主机上构建并验收正式的配对、发现和传输流程。
 
-Uses isolated configuration on both hosts and synthetic clipboard payloads. No
-user clipboard contents or pairing secrets are printed or uploaded to reports.
+两端使用隔离配置和构造的剪贴板载荷，不向报告输出或上传用户剪贴板内容及配对密钥。
 """
 import argparse
 import json

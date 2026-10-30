@@ -74,11 +74,10 @@ pub(crate) fn set_file_list(clipboard: &mut Clipboard, paths: &[PathBuf]) -> Res
     Ok(())
 }
 
-/// Copies existing files and directories to the system clipboard.
+/// 将已有文件和目录复制到系统剪贴板。
 ///
-/// Paths are resolved to absolute paths before writing. On Linux this blocks
-/// until another application replaces the clipboard, keeping its contents
-/// available for repeated pastes. Terminating the process can discard them.
+/// 写入前将路径解析为绝对路径。Linux 上会阻塞到其他应用替换剪贴板，
+/// 以支持反复粘贴；终止进程可能使剪贴板内容失效。
 pub fn copy_paths(paths: Vec<PathBuf>) -> Result<()> {
     let paths = normalize_copy_paths(paths)?;
     let mut clipboard = Clipboard::new().context(crate::i18n::tr("clipboard.unavailable"))?;
@@ -150,19 +149,19 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "internal fixture for linux_copy_keeps_owner_until_clipboard_is_replaced"]
+    #[ignore = "供 Linux 剪贴板所有权测试启动的内部子进程"]
     fn linux_copy_owner_fixture() {
         if let Some(path) = env::var_os("ZIPOVER_TEST_COPY_PATH") {
             copy_paths(vec![path.into()]).unwrap();
         }
     }
 
-    // Run only on an isolated X server, without a clipboard manager:
+    // 仅在未运行剪贴板管理器的隔离 X 服务器上执行：
     // env -u WAYLAND_DISPLAY ZIPOVER_TEST_CLIPBOARD_ISOLATED=1 xvfb-run -a \
     // cargo test -p zipover-core clipboard::tests::linux_copy_keeps_owner_until_clipboard_is_replaced -- --ignored --exact
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires an isolated X11 clipboard; see the command above this test"]
+    #[ignore = "需要隔离的 X11 剪贴板；执行命令见本测试上方注释"]
     fn linux_copy_keeps_owner_until_clipboard_is_replaced() {
         use std::process::{Child, Command, Stdio};
 
@@ -233,7 +232,7 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    #[ignore = "changes the system clipboard; run only in an isolated Windows session"]
+    #[ignore = "会改写系统剪贴板；仅在隔离的 Windows 会话中执行"]
     fn copying_files_replaces_stale_text_and_image_formats() {
         use arboard::ImageData;
         use std::borrow::Cow;

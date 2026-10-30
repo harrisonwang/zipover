@@ -12,7 +12,7 @@ use std::{
 };
 
 #[test]
-#[ignore = "requires the second host; run scripts/verify-lan.py"]
+#[ignore = "需要第二台主机；请运行 scripts/verify-lan.py"]
 fn lan_round_trip() {
     let role = env::var("ZIPOVER_TEST_ROLE").expect("ZIPOVER_TEST_ROLE");
     let other = if role == "mac" { "hp" } else { "mac" };
