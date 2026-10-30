@@ -64,7 +64,9 @@ impl Discovery {
 
     pub fn poll(&mut self, shared: &SharedPairing) {
         {
-            let pairing = shared.lock().expect("配对状态锁已损坏");
+            let pairing = shared.lock().unwrap_or_else(|error| {
+                panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+            });
             let inviting = pairing.is_inviting();
             if inviting != self.inviting {
                 let result = Self::service(&pairing.store.config, self.address, inviting)
@@ -85,7 +87,9 @@ impl Discovery {
             }
         }
         for event in self.receiver.try_iter() {
-            let mut pairing = shared.lock().expect("配对状态锁已损坏");
+            let mut pairing = shared.lock().unwrap_or_else(|error| {
+                panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+            });
             match event {
                 ServiceEvent::ServiceResolved(info) => {
                     if info

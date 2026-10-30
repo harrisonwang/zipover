@@ -111,7 +111,9 @@ pub(crate) fn clipboard_loop(
                 {
                     continue;
                 }
-                handle_incoming_event(event, &mut clipboard, &mut state);
+                if let Err(error) = handle_incoming_event(event, &mut clipboard, &mut state) {
+                    eprintln!("{error}");
+                }
             }
             expire_sessions(&mut state);
 
@@ -162,7 +164,7 @@ pub(crate) fn clipboard_loop(
                             crate::i18n::localized!(eprintln, "sync.sending", summary = summary);
                             state.sent_peers.extend(&targets);
                             state.last_fingerprint = Some(fingerprint);
-                            // Keep receiving while bounded outgoing queues apply backpressure.
+                            // 有界发送队列产生背压时，仍继续接收。
                             let hub = &hub;
                             outgoing = Some(
                                 scope.spawn(move || send_payload(hub, &targets, &id, payload)),
@@ -185,7 +187,7 @@ pub(crate) fn clipboard_loop(
 
             thread::sleep(POLL_INTERVAL);
         };
-        // Unblock pending socket writes before the scope joins its sending task.
+        // 在线程作用域等待发送任务结束前，先解除套接字写入的阻塞。
         hub.shutdown();
         result
     })
@@ -211,51 +213,51 @@ fn send_payload(hub: &PeerHub, peers: &[u64], id: &str, payload: CapturedPayload
     }
 }
 
-fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state: &mut SyncState) {
+fn handle_incoming_event(
+    event: IncomingEvent,
+    clipboard: &mut Clipboard,
+    state: &mut SyncState,
+) -> Result<()> {
     let (peer_id, message) = match event {
         IncomingEvent::Message { peer_id, message } => (peer_id, message),
         IncomingEvent::Disconnected { peer_id } => {
             state.sent_peers.remove(&peer_id);
             cleanup_peer_sessions(state, peer_id);
-            return;
+            return Ok(());
         }
     };
 
     match message {
         WireMessage::Clipboard { id, payload } => {
             if !valid_message_id(&id) || state.completed.contains(&id) {
-                return;
+                return Ok(());
             }
             let fingerprint = fingerprint(&payload);
             let summary = payload_summary(&payload);
             crate::i18n::localized!(eprintln, "sync.received", summary = summary);
-            match apply_payload(clipboard, &payload) {
-                Ok(()) => {
-                    state.completed.insert(&id);
-                    mark_remote_applied(state, fingerprint, peer_id);
-                    crate::i18n::localized!(eprintln, "sync.applied", summary = summary);
-                }
-                Err(error) => {
-                    crate::i18n::localized!(eprintln, "sync.apply_failed", error = error : {:#})
-                }
-            }
+            apply_payload(clipboard, &payload).map_err(
+                |error| crate::i18n::localized!(anyhow, "sync.apply_failed", error = error : {:#}),
+            )?;
+            state.completed.insert(&id);
+            mark_remote_applied(state, fingerprint, peer_id);
+            crate::i18n::localized!(eprintln, "sync.applied", summary = summary);
         }
         WireMessage::TransferStart { id, entries } => {
             if !valid_message_id(&id) || state.completed.contains(&id) {
-                return;
+                return Ok(());
             }
             let key = SessionKey::new(peer_id, id.clone());
             state.active_transfers.remove(&key);
             if state.active_transfers.len() >= MAX_ACTIVE_TRANSFERS {
                 crate::i18n::localized!(eprintln, "sync.too_many_file_transfers");
-                return;
+                return Ok(());
             }
             let Some(transfer_size) = entries
                 .iter()
                 .try_fold(0u64, |total, entry| total.checked_add(entry.size))
             else {
                 crate::i18n::localized!(eprintln, "sync.file_size_overflow");
-                return;
+                return Ok(());
             };
             let active_size = state
                 .active_transfers
@@ -264,29 +266,25 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
                 .sum::<u64>();
             if active_size.saturating_add(transfer_size) > MAX_ACTIVE_TRANSFER_BYTES {
                 crate::i18n::localized!(eprintln, "sync.file_size_limit");
-                return;
+                return Ok(());
             }
             let cache_scope = format!("{}-{peer_id}", state.origin);
-            match IncomingTransfer::start(id.clone(), &cache_scope, entries) {
-                Ok(transfer) => {
-                    crate::i18n::localized!(
-                        eprintln,
-                        "sync.receiving_files",
-                        summary = transfer.summary()
-                    );
-                    state.active_transfers.insert(
-                        key,
-                        ActiveTransfer {
-                            last_activity: Instant::now(),
-                            size: transfer_size,
-                            transfer,
-                        },
-                    );
-                }
-                Err(error) => {
-                    crate::i18n::localized!(eprintln, "sync.file_transfer_rejected", error = error : {:#})
-                }
-            }
+            let transfer = IncomingTransfer::start(id, &cache_scope, entries).map_err(|error| {
+                crate::i18n::localized!(anyhow, "sync.file_transfer_rejected", error = error : {:#})
+            })?;
+            crate::i18n::localized!(
+                eprintln,
+                "sync.receiving_files",
+                summary = transfer.summary()
+            );
+            state.active_transfers.insert(
+                key,
+                ActiveTransfer {
+                    last_activity: Instant::now(),
+                    size: transfer_size,
+                    transfer,
+                },
+            );
         }
         WireMessage::TransferChunk {
             id,
@@ -295,11 +293,11 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
             bytes,
         } => {
             if !valid_message_id(&id) || state.completed.contains(&id) {
-                return;
+                return Ok(());
             }
             let key = SessionKey::new(peer_id, id);
             let Some(active) = state.active_transfers.get_mut(&key) else {
-                return;
+                return Ok(());
             };
             active.last_activity = Instant::now();
             if let Err(error) = active.transfer.accept_chunk(file_index, offset, &bytes) {
@@ -313,11 +311,11 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
             sha256,
         } => {
             if !valid_message_id(&id) || state.completed.contains(&id) {
-                return;
+                return Ok(());
             }
             let key = SessionKey::new(peer_id, id);
             let Some(active) = state.active_transfers.get_mut(&key) else {
-                return;
+                return Ok(());
             };
             active.last_activity = Instant::now();
             if let Err(error) = active.transfer.finish_file(file_index, sha256) {
@@ -327,34 +325,30 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
         }
         WireMessage::TransferEnd { id } => {
             if !valid_message_id(&id) {
-                return;
+                return Ok(());
             }
             let key = SessionKey::new(peer_id, id.clone());
             if state.completed.contains(&id) {
                 state.active_transfers.remove(&key);
-                return;
+                return Ok(());
             }
             let Some(active) = state.active_transfers.remove(&key) else {
                 crate::i18n::localized!(eprintln, "sync.file_transfer_missing", id = id);
-                return;
+                return Ok(());
             };
             let summary = active.transfer.summary();
-            match active.transfer.finish() {
-                Ok(finished) => match set_file_list(clipboard, &finished.roots) {
-                    Ok(()) => {
-                        state.completed.insert(&id);
-                        mark_remote_applied(state, finished.fingerprint, peer_id);
-                        crate::i18n::localized!(eprintln, "sync.completed", summary = summary);
-                    }
-                    Err(error) => {
-                        crate::i18n::localized!(eprintln, "sync.write_file_list_failed", error = error : {:#});
-                        finished.cleanup();
-                    }
-                },
-                Err(error) => {
-                    crate::i18n::localized!(eprintln, "sync.file_completion_failed", error = error : {:#})
-                }
+            let finished = active.transfer.finish().map_err(|error| {
+                crate::i18n::localized!(anyhow, "sync.file_completion_failed", error = error : {:#})
+            })?;
+            if let Err(error) = set_file_list(clipboard, &finished.roots) {
+                finished.cleanup();
+                return Err(
+                    crate::i18n::localized!(anyhow, "sync.write_file_list_failed", error = error : {:#}),
+                );
             }
+            state.completed.insert(&id);
+            mark_remote_applied(state, finished.fingerprint, peer_id);
+            crate::i18n::localized!(eprintln, "sync.completed", summary = summary);
         }
         WireMessage::TransferAbort { id } => {
             let key = SessionKey::new(peer_id, id);
@@ -370,12 +364,12 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
             size,
         } => {
             if !valid_message_id(&id) || state.completed.contains(&id) {
-                return;
+                return Ok(());
             }
             let key = SessionKey::new(peer_id, id);
             if state.active_images.len() >= MAX_ACTIVE_IMAGES {
                 crate::i18n::localized!(eprintln, "sync.too_many_image_transfers");
-                return;
+                return Ok(());
             }
             let active_size = state
                 .active_images
@@ -384,38 +378,34 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
                 .sum::<u64>();
             if active_size.saturating_add(size) > MAX_ACTIVE_IMAGE_BYTES {
                 crate::i18n::localized!(eprintln, "sync.image_resource_limit");
-                return;
+                return Ok(());
             }
-            match IncomingImage::start(fingerprint, width, height, size) {
-                Ok(image) => {
-                    crate::i18n::localized!(
-                        eprintln,
-                        "sync.receiving_image",
-                        width = width,
-                        height = height,
-                        size = format_bytes(size)
-                    );
-                    state.active_images.insert(
-                        key,
-                        ActiveImage {
-                            last_activity: Instant::now(),
-                            image,
-                            size,
-                        },
-                    );
-                }
-                Err(error) => {
-                    crate::i18n::localized!(eprintln, "sync.image_transfer_rejected", error = error : {:#})
-                }
-            }
+            let image = IncomingImage::start(fingerprint, width, height, size).map_err(|error| {
+                crate::i18n::localized!(anyhow, "sync.image_transfer_rejected", error = error : {:#})
+            })?;
+            crate::i18n::localized!(
+                eprintln,
+                "sync.receiving_image",
+                width = width,
+                height = height,
+                size = format_bytes(size)
+            );
+            state.active_images.insert(
+                key,
+                ActiveImage {
+                    last_activity: Instant::now(),
+                    image,
+                    size,
+                },
+            );
         }
         WireMessage::ImageChunk { id, offset, bytes } => {
             if !valid_message_id(&id) || state.completed.contains(&id) {
-                return;
+                return Ok(());
             }
             let key = SessionKey::new(peer_id, id);
             let Some(active) = state.active_images.get_mut(&key) else {
-                return;
+                return Ok(());
             };
             active.last_activity = Instant::now();
             if let Err(error) = active.image.accept_chunk(offset, &bytes) {
@@ -425,34 +415,29 @@ fn handle_incoming_event(event: IncomingEvent, clipboard: &mut Clipboard, state:
         }
         WireMessage::ImageEnd { id, sha256 } => {
             if !valid_message_id(&id) {
-                return;
+                return Ok(());
             }
             let key = SessionKey::new(peer_id, id.clone());
             if state.completed.contains(&id) {
                 state.active_images.remove(&key);
-                return;
+                return Ok(());
             }
             let Some(active) = state.active_images.remove(&key) else {
                 crate::i18n::localized!(eprintln, "sync.image_transfer_missing", id = id);
-                return;
+                return Ok(());
             };
-            match active.image.finish(sha256) {
-                Ok((fingerprint, payload)) => match apply_payload(clipboard, &payload) {
-                    Ok(()) => {
-                        state.completed.insert(&id);
-                        mark_remote_applied(state, fingerprint, peer_id);
-                        crate::i18n::localized!(eprintln, "sync.image_applied");
-                    }
-                    Err(error) => {
-                        crate::i18n::localized!(eprintln, "sync.apply_image_failed", error = error : {:#})
-                    }
-                },
-                Err(error) => {
-                    crate::i18n::localized!(eprintln, "sync.image_completion_failed", error = error : {:#})
-                }
-            }
+            let (fingerprint, payload) = active.image.finish(sha256).map_err(|error| {
+                crate::i18n::localized!(anyhow, "sync.image_completion_failed", error = error : {:#})
+            })?;
+            apply_payload(clipboard, &payload).map_err(|error| {
+                crate::i18n::localized!(anyhow, "sync.apply_image_failed", error = error : {:#})
+            })?;
+            state.completed.insert(&id);
+            mark_remote_applied(state, fingerprint, peer_id);
+            crate::i18n::localized!(eprintln, "sync.image_applied");
         }
     }
+    Ok(())
 }
 
 fn mark_remote_applied(state: &mut SyncState, fingerprint: u64, peer_id: u64) {

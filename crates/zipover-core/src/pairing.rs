@@ -74,7 +74,7 @@ impl Pairing {
     }
 
     fn start_invitation(&mut self) -> Result<String> {
-        // Rejection sampling includes leading zeros and avoids modulo bias.
+        // 拒绝采样既保留前导零，也避免取模偏差。
         let number = loop {
             let number = u32::from_le_bytes(random_bytes()?);
             if number < u32::MAX - u32::MAX % 1_000_000 {
@@ -96,7 +96,7 @@ impl Pairing {
     }
 
     pub fn is_inviting(&self) -> bool {
-        // Renewal must not briefly withdraw the discovery advertisement.
+        // 更新配对码时不能短暂撤销设备发现广播。
         self.invitation.is_some()
     }
 
@@ -188,7 +188,7 @@ impl Pairing {
         Ok(invitation.attempt.clone())
     }
 
-    // Only called after SPAKE2 and the encrypted handshake confirm the code.
+    // 仅在 SPAKE2 和加密握手确认配对码后调用。
     pub(crate) fn accept(
         &mut self,
         peer: TrustedPeer,
@@ -225,9 +225,8 @@ impl Pairing {
         } else if self.invitation.as_ref().is_some_and(|i| {
             i.attempt.generation == attempt.generation && i.attempts >= MAX_ATTEMPTS
         }) {
-            // Keep invitation mode usable after exhausting the guess budget.
-            // Rotating here also means the UI never needs a manual regenerate
-            // action for a recoverable pairing failure.
+            // 猜测次数耗尽后仍保持邀请模式可用，并在此轮换配对码，
+            // 使界面无需为可恢复的配对失败提供手动重新生成功能。
             if self.start_invitation().is_err() {
                 self.invitation = None;
                 self.error = Some(crate::i18n::tr("pairing.generate_code_failed").into());
@@ -242,9 +241,8 @@ impl Pairing {
             .as_ref()
             .is_some_and(|i| i.attempt.expires <= now)
         {
-            // Keep the user's invitation mode active and rotate the short-lived
-            // code in place. The discovery advertisement remains available, so
-            // another device can continue pairing without reopening the panel.
+            // 保持邀请模式开启，并直接轮换短期配对码。设备发现广播持续可用，
+            // 其他设备无需等待重新打开面板即可继续配对。
             if self.start_invitation().is_err() {
                 self.invitation = None;
                 self.error = Some(crate::i18n::tr("pairing.generate_code_failed").into());
@@ -272,8 +270,8 @@ impl Pairing {
             .as_ref()
             .is_some_and(|r| r.attempt.expires <= now)
         {
-            // A joining device has no new code to display; return it to the
-            // input state and let the user enter the inviter's current code.
+            // 加入配对的设备没有新配对码可显示，应返回输入状态，
+            // 让用户输入邀请设备当前显示的配对码。
             self.request = None;
             self.error = Some(crate::i18n::tr("pairing.code_expired").into());
         }

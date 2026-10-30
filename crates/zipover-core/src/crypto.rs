@@ -1,5 +1,5 @@
-//! Noise supplies the authenticated handshake, forward secrecy, and directional keys.
-//! TCP records use implicit increasing nonces; replay, reordering, and tampering fail closed.
+//! Noise 提供认证握手、前向保密和双向独立密钥。
+//! TCP 记录使用隐式递增的 nonce；检测到重放、乱序或篡改时立即拒绝。
 use crate::config::PairingKey;
 use crate::protocol::FRAME_LIMIT;
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,8 +20,8 @@ pub(crate) enum ConnectionRole {
     Responder,
 }
 
-// Never use a short code directly as a Noise PSK: a recorded handshake would
-// allow offline guessing. SPAKE2 derives a fresh strong key; Noise confirms it.
+// 不要直接将短配对码用作 Noise PSK，否则攻击者可录制握手并离线猜测。
+// 先由 SPAKE2 派生新的高强度密钥，再通过 Noise 确认。
 pub(crate) fn pairing_key(
     stream: &mut TcpStream,
     role: ConnectionRole,
@@ -64,7 +64,7 @@ pub(crate) fn handshake(
         ConnectionRole::Initiator => builder.build_initiator()?,
         ConnectionRole::Responder => builder.build_responder()?,
     };
-    // NNpsk0 has exactly two handshake messages, e + tag (48 bytes) each.
+    // NNpsk0 恰有两条握手消息，每条包含 e 和认证标签，共 48 字节。
     let mut message = [0; 48];
     while !noise.is_handshake_finished() {
         if noise.is_my_turn() {
@@ -101,7 +101,12 @@ impl Cipher {
 
     pub fn read_frame(&mut self, stream: &mut impl Read) -> Result<Vec<u8>> {
         let length = self.read_record(stream, 4)?;
-        let length = u32::from_be_bytes(length.try_into().expect("已读取四字节长度")) as usize;
+        let length = u32::from_be_bytes(length.try_into().unwrap_or_else(|error| {
+            panic!(
+                "{}: {error:?}",
+                crate::i18n::tr("crypto.length_prefix_size")
+            )
+        })) as usize;
         if length == 0 || length > FRAME_LIMIT {
             crate::i18n::localized!(bail, "crypto.invalid_incoming_size")
         }

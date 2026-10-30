@@ -3,7 +3,7 @@ use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 
 const DEFAULT_PORT: u16 = 57321;
 
-/// Parse a manually entered IP address, optionally followed by a listening port.
+/// 解析手动输入的 IP 地址，可附带监听端口。
 pub fn parse_pairing_address(value: &str) -> Result<SocketAddr> {
     let value = value.trim();
     let address = value

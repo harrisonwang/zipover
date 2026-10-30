@@ -107,7 +107,7 @@ fn ipv6_multicast_discovers_a_connectable_ipv6_service() {
     let fullname = service.get_fullname().to_owned();
     let publisher = ServiceDaemon::new().unwrap();
     let browser = ServiceDaemon::new().unwrap();
-    // Ensure the resolve cannot silently succeed only through IPv4 mDNS.
+    // 确保解析不会仅依赖 IPv4 mDNS 而意外通过。
     publisher.disable_interface(IfKind::All).unwrap();
     browser.disable_interface(IfKind::All).unwrap();
     publisher

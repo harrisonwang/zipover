@@ -31,19 +31,10 @@ const PEER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTGOING_QUEUE_SIZE: usize = 16;
 static NEXT_PEER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct PeerHub {
     peers: Arc<Mutex<Vec<Peer>>>,
     shutdown: Arc<AtomicBool>,
-}
-
-impl Default for PeerHub {
-    fn default() -> Self {
-        Self {
-            peers: Arc::new(Mutex::new(Vec::new())),
-            shutdown: Arc::new(AtomicBool::new(false)),
-        }
-    }
 }
 
 struct Peer {
@@ -51,7 +42,7 @@ struct Peer {
     device_id: DeviceId,
     sender: SyncSender<Arc<[u8]>>,
     alive: Arc<AtomicBool>,
-    stream: Arc<Mutex<TcpStream>>,
+    stream: TcpStream,
 }
 
 impl PeerHub {
@@ -61,7 +52,7 @@ impl PeerHub {
         device_id: DeviceId,
         sender: SyncSender<Arc<[u8]>>,
         alive: Arc<AtomicBool>,
-        stream: Arc<Mutex<TcpStream>>,
+        stream: TcpStream,
     ) -> Result<bool> {
         if !alive.load(Ordering::Relaxed) {
             return Ok(false);
@@ -99,7 +90,9 @@ impl PeerHub {
     pub(crate) fn devices(&self) -> Vec<DeviceId> {
         self.peers
             .lock()
-            .expect("设备列表锁已损坏")
+            .unwrap_or_else(|error| {
+                panic!("{}: {error:?}", crate::i18n::tr("transport.lock_poisoned"))
+            })
             .iter()
             .filter(|peer| peer.alive.load(Ordering::Relaxed))
             .map(|peer| peer.device_id)
@@ -109,23 +102,23 @@ impl PeerHub {
     pub(crate) fn is_connected(&self, id: u64) -> bool {
         self.peers
             .lock()
-            .expect("设备列表锁已损坏")
+            .unwrap_or_else(|error| {
+                panic!("{}: {error:?}", crate::i18n::tr("transport.lock_poisoned"))
+            })
             .iter()
             .any(|peer| peer.peer_id == id && peer.alive.load(Ordering::Acquire))
     }
 
     pub(crate) fn disconnect_device(&self, id: DeviceId) {
-        let mut peers = self.peers.lock().expect("设备列表锁已损坏");
+        let mut peers = self.peers.lock().unwrap_or_else(|error| {
+            panic!("{}: {error:?}", crate::i18n::tr("transport.lock_poisoned"))
+        });
         peers.retain(|peer| {
             if peer.device_id != id {
                 return true;
             }
             peer.alive.store(false, Ordering::Release);
-            let _ = peer
-                .stream
-                .lock()
-                .expect("设备连接锁已损坏")
-                .shutdown(Shutdown::Both);
+            let _ = peer.stream.shutdown(Shutdown::Both);
             false
         });
     }
@@ -136,14 +129,12 @@ impl PeerHub {
     }
 
     pub(crate) fn disconnect_all(&self) {
-        let peers = self.peers.lock().expect("设备列表锁已损坏");
+        let peers = self.peers.lock().unwrap_or_else(|error| {
+            panic!("{}: {error:?}", crate::i18n::tr("transport.lock_poisoned"))
+        });
         for peer in peers.iter() {
             peer.alive.store(false, Ordering::Release);
-            let _ = peer
-                .stream
-                .lock()
-                .expect("设备连接锁已损坏")
-                .shutdown(Shutdown::Both);
+            let _ = peer.stream.shutdown(Shutdown::Both);
         }
     }
 
@@ -216,8 +207,8 @@ fn encode_message(message: &WireMessage) -> Result<Arc<[u8]>> {
     Ok(Arc::from(frame.into_boxed_slice()))
 }
 
-// A fixed preface routes to the right pairwise key; Noise binds the entire
-// preface into its transcript, so changing either identity or mode fails auth.
+// 固定前导信息用于选择设备间的配对密钥；Noise 将完整前导信息绑定到握手记录，
+// 因而身份或模式被篡改时，认证会失败。
 const MAGIC: &[u8; 5] = b"ZPOV2";
 const PREFACE_LEN: usize = 38;
 
@@ -236,7 +227,9 @@ pub(crate) fn network_loop(
             discovery.poll(&shared);
         }
         {
-            let mut pairing = shared.lock().expect("配对状态锁已损坏");
+            let mut pairing = shared.lock().unwrap_or_else(|error| {
+                panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+            });
             pairing.expire();
         }
         jobs.retain(|(_, job)| !job.is_finished());
@@ -264,7 +257,9 @@ pub(crate) fn network_loop(
         if Instant::now() >= next_connect {
             next_connect = Instant::now() + Duration::from_secs(2);
             let active = hub.devices();
-            let mut pairing = shared.lock().expect("配对状态锁已损坏");
+            let mut pairing = shared.lock().unwrap_or_else(|error| {
+                panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+            });
             let local_id = pairing.store.config.id;
             let mut targets: Vec<(DeviceId, ConnectionAuth, PeerAddresses)> = Vec::new();
             for trusted in &pairing.store.config.peers {
@@ -380,7 +375,7 @@ pub(crate) fn network_loop(
                             if let ConnectionAuth::Pair(attempt) = &auth {
                                 shared
                                     .lock()
-                                    .expect("配对状态锁已损坏")
+                                    .unwrap_or_else(|error| panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned")))
                                     .failed(attempt, ConnectionRole::Initiator);
                             }
                         }
@@ -483,7 +478,9 @@ fn establish(
     stream.set_write_timeout(Some(PEER_SEND_TIMEOUT))?;
     stream.set_nodelay(true)?;
     let (local_id, local_name) = {
-        let pairing = shared.lock().expect("配对状态锁已损坏");
+        let pairing = shared.lock().unwrap_or_else(|error| {
+            panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+        });
         (pairing.store.config.id, pairing.store.config.name.clone())
     };
     let mut preface = [0; PREFACE_LEN];
@@ -491,7 +488,7 @@ fn establish(
         preface[..5].copy_from_slice(MAGIC);
         preface[5..21].copy_from_slice(&local_id);
         preface[21..37].copy_from_slice(&id);
-        // Mode 1 was the old long-code flow. Never interpret it as a numeric code.
+        // 模式 1 对应旧的长配对码流程，不能将其解释为数字配对码。
         preface[37] = if matches!(auth, ConnectionAuth::Pair(_)) {
             2
         } else {
@@ -508,8 +505,15 @@ fn establish(
         {
             crate::i18n::localized!(bail, "transport.protocol_mismatch")
         }
-        let id: DeviceId = preface[5..21].try_into().expect("固定长度 ID");
-        let mut pairing = shared.lock().expect("配对状态锁已损坏");
+        let id: DeviceId = preface[5..21].try_into().unwrap_or_else(|error| {
+            panic!(
+                "{}: {error:?}",
+                crate::i18n::tr("transport.fixed_device_id_size")
+            )
+        });
+        let mut pairing = shared.lock().unwrap_or_else(|error| {
+            panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+        });
         let auth = if pairing_mode {
             ConnectionAuth::Pair(pairing.begin_incoming()?)
         } else {
@@ -525,8 +529,8 @@ fn establish(
         let key = match &auth {
             ConnectionAuth::Trusted(key) => *key,
             ConnectionAuth::Pair(attempt) => {
-                // Return the responder ID for the explicit-address fallback; bind it
-                // into both PAKE and Noise even when the caller did not know it.
+                // 为手动地址连接返回响应端 ID；即使调用方事先未知该 ID，
+                // 也要将其同时绑定到 PAKE 和 Noise。
                 let mut responder = local_id;
                 if role == ConnectionRole::Initiator {
                     stream.read_exact(&mut responder)?;
@@ -556,8 +560,8 @@ fn establish(
                 id,
                 key,
                 name: remote_name.clone(),
-                // Only outbound targets are listening endpoints. The incoming
-                // TCP source port belongs to a temporary client socket.
+                // 只有主动连接的目标地址才是监听端点；传入 TCP 连接的
+                // 来源端口属于临时客户端套接字。
                 addresses: if role == ConnectionRole::Initiator {
                     vec![stream.peer_addr()?]
                 } else {
@@ -570,20 +574,26 @@ fn establish(
                 }
                 shared
                     .lock()
-                    .expect("配对状态锁已损坏")
+                    .unwrap_or_else(|error| {
+                        panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+                    })
                     .accept(peer, attempt, role)?;
                 writer.write_frame(&mut stream, b"paired")?;
             } else {
                 shared
                     .lock()
-                    .expect("配对状态锁已损坏")
+                    .unwrap_or_else(|error| {
+                        panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+                    })
                     .accept(peer, attempt, role)?;
                 writer.write_frame(&mut stream, b"paired")?;
                 if reader.read_frame(&mut stream)? != b"paired" {
                     crate::i18n::localized!(bail, "transport.pairing_not_saved")
                 }
             }
-            let mut pairing = shared.lock().expect("配对状态锁已损坏");
+            let mut pairing = shared.lock().unwrap_or_else(|error| {
+                panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+            });
             pairing.result = Some(crate::i18n::localized!(
                 format,
                 "transport.paired",
@@ -597,7 +607,9 @@ fn establish(
             );
             return Ok(());
         }
-        let pairing = shared.lock().expect("配对状态锁已损坏");
+        let pairing = shared.lock().unwrap_or_else(|error| {
+            panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+        });
         if pairing.key_for(id)? != key {
             crate::i18n::localized!(bail, "transport.unpaired")
         }
@@ -617,7 +629,9 @@ fn establish(
     {
         shared
             .lock()
-            .expect("配对状态锁已损坏")
+            .unwrap_or_else(|error| {
+                panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+            })
             .failed(attempt, role);
     }
     result
@@ -635,7 +649,7 @@ fn register_connection(
     let (outgoing_tx, outgoing_rx) = mpsc::sync_channel::<Arc<[u8]>>(OUTGOING_QUEUE_SIZE);
     let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
     let alive = Arc::new(AtomicBool::new(true));
-    let stream_for_shutdown = Arc::new(Mutex::new(stream.try_clone()?));
+    let stream_for_shutdown = stream.try_clone()?;
     let mut writer = stream.try_clone()?;
     let mut reader = stream;
     if !hub.add(
@@ -700,19 +714,54 @@ mod tests {
     #[test]
     fn only_one_connection_per_device_is_registered() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let (stream, _) = listener.accept().unwrap();
-        let stream = Arc::new(Mutex::new(stream));
         let hub = PeerHub::default();
         let (tx, _rx) = mpsc::sync_channel(1);
         let alive = Arc::new(AtomicBool::new(true));
         assert!(
-            hub.add(1, [1; 16], tx.clone(), alive.clone(), stream.clone())
-                .unwrap()
+            hub.add(
+                1,
+                [1; 16],
+                tx.clone(),
+                alive.clone(),
+                stream.try_clone().unwrap()
+            )
+            .unwrap()
         );
         assert!(!hub.add(2, [1; 16], tx, alive, stream).unwrap());
         assert_eq!(hub.devices(), vec![[1; 16]]);
         hub.shutdown();
+        assert_eq!(client.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn disconnecting_device_unblocks_its_idle_reader() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let hub = PeerHub::default();
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let alive = Arc::new(AtomicBool::new(true));
+        hub.add(1, [1; 16], tx, alive.clone(), stream.try_clone().unwrap())
+            .unwrap();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            finished_tx.send(stream.read(&mut [0])).unwrap();
+        });
+
+        hub.disconnect_device([1; 16]);
+
+        let result = finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("disconnect should wake the blocked socket reader");
+        assert!(matches!(result, Ok(0) | Err(_)));
+        assert!(!alive.load(Ordering::Acquire));
+        assert!(hub.devices().is_empty());
+        reader.join().unwrap();
         drop(client);
     }
 
@@ -801,7 +850,7 @@ mod tests {
         assert_eq!(pair_over_tcp(&a, &b, wrong, true), (false, false));
         assert!(a.lock().unwrap().store.config.peers.is_empty());
         assert!(b.lock().unwrap().store.config.peers.is_empty());
-        // Direct address fallback has no target ID until the authenticated exchange.
+        // 手动地址连接在完成认证交换前，不知道目标设备 ID。
         assert_eq!(pair_over_tcp(&a, &b, &code, false), (true, true));
         let key = a.lock().unwrap().store.config.peers[0].key;
         assert_eq!(key, b.lock().unwrap().store.config.peers[0].key);
@@ -839,5 +888,29 @@ mod tests {
         );
         drop((a, b, c));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn poisoned_device_list_panic_uses_current_language() {
+        let hub = PeerHub::default();
+        let peers = hub.peers.clone();
+        // 在另一个线程持锁时触发 panic，模拟设备列表锁中毒。
+        assert!(
+            thread::spawn(move || {
+                let _guard = peers.lock().unwrap();
+                panic!("测试用设备列表锁中毒");
+            })
+            .join()
+            .is_err()
+        );
+
+        let payload =
+            std::panic::catch_unwind(|| hub.devices()).expect_err("设备列表锁中毒后应触发 panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .expect("panic 应包含文本信息");
+        assert!(message.contains(crate::i18n::tr("transport.lock_poisoned").as_ref()));
     }
 }

@@ -148,7 +148,7 @@ pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N]> {
 }
 
 fn config_dir() -> Result<PathBuf> {
-    // Also permits isolated CLI acceptance tests without touching the user's pairing.
+    // 同时支持隔离的 CLI 验收测试，避免改动用户的配对配置。
     if let Some(path) = env::var_os("ZIPOVER_CONFIG_DIR") {
         return Ok(PathBuf::from(path));
     }

@@ -109,7 +109,9 @@ impl SyncRuntime {
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let pairing = self.pairing.lock().expect("配对状态锁已损坏");
+        let pairing = self.pairing.lock().unwrap_or_else(|error| {
+            panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+        });
         let connected = self.hub.devices();
         let devices: Vec<_> = pairing
             .store
@@ -147,29 +149,45 @@ impl SyncRuntime {
     }
 
     pub fn generate_code(&self) -> Result<String> {
-        self.pairing.lock().expect("配对状态锁已损坏").invite()
+        self.pairing
+            .lock()
+            .unwrap_or_else(|error| {
+                panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+            })
+            .invite()
     }
 
     pub fn join(&self, code: &str, device: Option<String>) -> Result<()> {
         self.pairing
             .lock()
-            .expect("配对状态锁已损坏")
+            .unwrap_or_else(|error| {
+                panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+            })
             .join(code, device)
     }
 
     pub fn join_at(&self, code: &str, endpoint: SocketAddr) -> Result<()> {
         self.pairing
             .lock()
-            .expect("配对状态锁已损坏")
+            .unwrap_or_else(|error| {
+                panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+            })
             .join_at(code, endpoint)
     }
 
     pub fn cancel_pairing(&self) {
-        self.pairing.lock().expect("配对状态锁已损坏").cancel();
+        self.pairing
+            .lock()
+            .unwrap_or_else(|error| {
+                panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+            })
+            .cancel();
     }
 
     pub fn forget(&self, id: DeviceId) -> Result<()> {
-        let mut pairing = self.pairing.lock().expect("配对状态锁已损坏");
+        let mut pairing = self.pairing.lock().unwrap_or_else(|error| {
+            panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
+        });
         pairing.store.forget(id)?;
         self.hub.disconnect_device(id);
         Ok(())
@@ -182,7 +200,7 @@ impl SyncRuntime {
     pub fn wait(mut self) -> Result<()> {
         self.clipboard_thread
             .take()
-            .expect("同步运行时持有剪贴板线程")
+            .unwrap_or_else(|| panic!("{}", crate::i18n::tr("runtime.clipboard_thread_missing")))
             .join()
             .map_err(|_| crate::i18n::localized!(anyhow, "runtime.clipboard_thread_stopped"))?
     }
@@ -193,7 +211,7 @@ pub(crate) fn bind_listener(address: SocketAddr) -> io::Result<TcpListener> {
         return TcpListener::bind(address);
     }
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-    // Set this explicitly because the default differs between operating systems.
+    // 各操作系统的默认值不同，因此在此显式设置。
     socket.set_only_v6(false)?;
     socket.bind(&address.into())?;
     socket.listen(128)?;

@@ -1,6 +1,4 @@
-//! Real two-host test, driven by scripts/verify-lan.py. It uses the production
-//! discovery, encrypted connections, and file/image protocol without touching
-//! either user's system clipboard or production pairing configuration.
+//! 由 scripts/verify-lan.py 驱动的真实双主机测试，使用正式的设备发现、加密连接以及文件和图片协议，不改动两端用户的系统剪贴板或正式配对配置。
 use super::*;
 use crate::{
     SyncOptions, config::ConfigStore, discovery::Discovery, image, pairing::Pairing,
@@ -201,7 +199,7 @@ fn lan_round_trip() {
             println!(
                 "PASS {role} round {round}: bidirectional text, 2 MiB file, Unicode directory, empty file, PNG"
             );
-            // Wait for both queued acknowledgements to leave before disconnecting.
+            // 等待双方队列中的确认消息发出后再断开连接。
             thread::sleep(Duration::from_millis(500));
             if round == 0 {
                 hub.disconnect_all();

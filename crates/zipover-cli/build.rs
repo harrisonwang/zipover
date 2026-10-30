@@ -21,6 +21,7 @@ fn main() {
         ),
     )
     .unwrap();
+    // 这是构建期诊断，不随运行时语言设置切换。
     embed_resource::compile(&resource, embed_resource::NONE)
         .manifest_required()
         .expect("无法嵌入 Windows 图标和应用清单");

@@ -133,8 +133,8 @@ fn manual_pairing_round_trip(listen: SocketAddr) {
         root.join("b/devices.json"),
         root.join("c/devices.json"),
     );
-    // The sender has the greatest ID: saved addresses must not depend on the
-    // mDNS rule that only the smaller device initiates a connection.
+    // 发送端具有最大的 ID：使用已保存地址连接时，不能依赖
+    // mDNS 中仅由较小 ID 设备主动连接的规则。
     seed(&a_path, [3; 16]);
     seed(&b_path, [1; 16]);
     seed(&c_path, [2; 16]);
@@ -148,7 +148,7 @@ fn manual_pairing_round_trip(listen: SocketAddr) {
     a.pairing.lock().unwrap().join(&code, None).unwrap();
     wait(|| a.pairing.lock().unwrap().store.config.peers.len() == 1);
     let code = c.pairing.lock().unwrap().invite().unwrap();
-    // This request must override the process's earlier --connect target.
+    // 此请求必须覆盖进程此前通过 --connect 指定的目标。
     a.pairing.lock().unwrap().join_at(&code, c.address).unwrap();
     wait(|| a.pairing.lock().unwrap().store.config.peers.len() == 2);
     wait(|| a.hub.devices().len() == 2 && b.hub.devices().len() == 1 && c.hub.devices().len() == 1);
@@ -190,7 +190,7 @@ fn manual_pairing_round_trip(listen: SocketAddr) {
     probe(&a, &[&b, &c], "before restart");
     let (a_address, b_address, c_address) = (a.address, b.address, c.address);
     drop((a, b, c));
-    // No pairing code, --connect override, discovery service or clipboard.
+    // 不使用配对码、--connect 参数、设备发现服务或剪贴板。
     let b = Node::start(&b_path, Some(b_address), None);
     let c = Node::start(&c_path, Some(c_address), None);
     let a = Node::start(&a_path, Some(a_address), None);

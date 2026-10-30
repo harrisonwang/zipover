@@ -664,20 +664,7 @@ impl IncomingTransfer {
     }
 
     pub(crate) fn summary(&self) -> String {
-        let file_count = self.files.len();
-        let directory_count = self
-            .entries
-            .iter()
-            .filter(|entry| matches!(entry.kind, TransferEntryKind::Directory))
-            .count();
-        let total_bytes = self.entries.iter().map(|entry| entry.size).sum::<u64>();
-        crate::i18n::localized!(
-            format,
-            "files.summary",
-            files = file_count,
-            folders = directory_count,
-            size = format_bytes(total_bytes)
-        )
+        entry_summary(self.entries.iter())
     }
 }
 
@@ -696,21 +683,18 @@ impl FinishedTransfer {
     }
 }
 pub(crate) fn files_summary(files: &CapturedFiles) -> String {
-    let file_count = files
-        .entries
-        .iter()
-        .filter(|entry| matches!(entry.entry.kind, TransferEntryKind::File))
-        .count();
-    let directory_count = files
-        .entries
-        .iter()
-        .filter(|entry| matches!(entry.entry.kind, TransferEntryKind::Directory))
-        .count();
-    let total_bytes = files
-        .entries
-        .iter()
-        .map(|entry| entry.entry.size)
-        .sum::<u64>();
+    entry_summary(files.entries.iter().map(|local| &local.entry))
+}
+
+fn entry_summary<'a>(entries: impl Iterator<Item = &'a TransferEntry>) -> String {
+    let (mut file_count, mut directory_count, mut total_bytes) = (0usize, 0usize, 0u64);
+    for entry in entries {
+        match entry.kind {
+            TransferEntryKind::File => file_count += 1,
+            TransferEntryKind::Directory => directory_count += 1,
+        }
+        total_bytes += entry.size;
+    }
     crate::i18n::localized!(
         format,
         "files.summary",
@@ -737,33 +721,17 @@ pub(crate) fn portable_relative_path(path: &Path) -> Result<Vec<u8>> {
 
 pub(crate) fn safe_relative_path(path: &[u8]) -> Result<PathBuf> {
     let mut result = PathBuf::new();
-    let mut component = Vec::new();
-    for byte in path {
-        if *byte == b'/' || *byte == b'\\' {
-            push_safe_component(&mut component, &mut result, path)?;
-        } else {
-            component.push(*byte);
+    for component in path.split(|byte| matches!(*byte, b'/' | b'\\')) {
+        if component.is_empty() || component == b"." || component == b".." {
+            crate::i18n::localized!(
+                bail,
+                "files.invalid_transfer_component",
+                path = path_display(path)
+            )
         }
+        result.push(os_string_from_bytes(&portable_component(component))?);
     }
-    push_safe_component(&mut component, &mut result, path)?;
     Ok(result)
-}
-
-fn push_safe_component(
-    component: &mut Vec<u8>,
-    result: &mut PathBuf,
-    full_path: &[u8],
-) -> Result<()> {
-    if component.is_empty() || component == b"." || component == b".." {
-        crate::i18n::localized!(
-            bail,
-            "files.invalid_transfer_component",
-            path = path_display(full_path)
-        )
-    }
-    result.push(os_string_from_bytes(&portable_component(component))?);
-    component.clear();
-    Ok(())
 }
 
 pub(crate) fn path_collision_key(path: &[u8]) -> Vec<u8> {
@@ -822,24 +790,8 @@ fn portable_component(value: &[u8]) -> Vec<u8> {
             | b"PRN"
             | b"AUX"
             | b"NUL"
-            | b"COM1"
-            | b"COM2"
-            | b"COM3"
-            | b"COM4"
-            | b"COM5"
-            | b"COM6"
-            | b"COM7"
-            | b"COM8"
-            | b"COM9"
-            | b"LPT1"
-            | b"LPT2"
-            | b"LPT3"
-            | b"LPT4"
-            | b"LPT5"
-            | b"LPT6"
-            | b"LPT7"
-            | b"LPT8"
-            | b"LPT9"
+            | [b'C', b'O', b'M', b'1'..=b'9']
+            | [b'L', b'P', b'T', b'1'..=b'9']
     );
     if reserved {
         result.insert(device_name_end, b'_');
@@ -956,4 +908,51 @@ fn apply_mode(path: &Path, mode: Option<u32>) -> Result<()> {
 #[cfg(not(unix))]
 fn apply_mode(_path: &Path, _mode: Option<u32>) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_paths_preserve_mixed_separators_and_portable_names() {
+        assert_eq!(
+            safe_relative_path(b"folder\\nested/report?.txt").unwrap(),
+            PathBuf::from("folder").join("nested").join("report_.txt")
+        );
+    }
+
+    #[test]
+    fn relative_paths_reject_traversal_and_empty_components() {
+        for path in [
+            b"".as_slice(),
+            b"../secret",
+            b"folder/../secret",
+            b"folder/./item",
+            b"/secret",
+            b"folder//item",
+            b"folder\\\\item",
+            b"folder/",
+            b"folder\\",
+        ] {
+            assert!(safe_relative_path(path).is_err(), "accepted {path:?}");
+        }
+    }
+
+    #[test]
+    fn reserved_device_names_are_sanitized_without_changing_similar_names() {
+        for (name, expected) in [
+            ("com1.txt", "com1_.txt"),
+            ("COM9", "COM9_"),
+            ("Lpt1.log", "Lpt1_.log"),
+            ("LPT9", "LPT9_"),
+            ("CON.txt", "CON_.txt"),
+            ("COM0", "COM0"),
+            ("COM10", "COM10"),
+            ("LPT0", "LPT0"),
+            ("LPT10", "LPT10"),
+        ] {
+            assert_eq!(portable_component(name.as_bytes()), expected.as_bytes());
+        }
+    }
 }
