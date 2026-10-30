@@ -124,11 +124,26 @@ impl SyncState {
         format!("{}-{}", self.origin, self.sequence)
     }
 
+    /// 记录启动时已存在的剪贴板内容：不算一次本地复制，因而不推进版本。
+    fn seed(&mut self, fingerprint: u64) {
+        self.last_fingerprint = Some(fingerprint);
+    }
+
+    /// 单人跨机使用按墙上时钟毫秒定先后，重启与离线都不会让版本倒退。
+    fn next_counter(&self) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        now.max(self.version.counter.saturating_add(1))
+    }
+
     fn observe_fingerprint(&mut self, fingerprint: u64) {
         if self.last_fingerprint != Some(fingerprint) {
             self.last_fingerprint = Some(fingerprint);
+            let counter = self.next_counter();
             self.version = ClipboardVersion {
-                counter: self.version.counter + 1,
+                counter,
                 origin: self.local_id,
             };
             self.applied_version = Some(self.version);
@@ -211,6 +226,10 @@ pub(crate) fn clipboard_loop(
     let mut state = SyncState::new(local_id);
     let mut cache = CaptureCache::default();
     let mut next_cache_cleanup = Instant::now();
+    // 启动时剪贴板里已有的内容由系统保留，不是用户此刻的复制：只记录，不发布。
+    if let Ok(Some(payload)) = capture_payload(&mut clipboard, &mut cache) {
+        state.seed(captured_fingerprint(&payload));
+    }
 
     thread::scope(|scope| {
         let mut outgoing: HashMap<u64, OutgoingSend<'_>> = HashMap::new();
@@ -292,51 +311,57 @@ pub(crate) fn clipboard_loop(
                 match capture_payload(&mut clipboard, &mut cache) {
                     Ok(Some(payload)) => {
                         state.last_capture_error = None;
-                        state.observe_fingerprint(captured_fingerprint(&payload));
-                        discard_obsolete_transfers(&mut state, &hub);
-                        let internal =
-                            matches!(&payload, CapturedPayload::Files(files) if files.internal);
-                        if internal {
+                        // 自己写回剪贴板的缓存文件不是用户新复制的内容。推进版本会让
+                        // 对端下一次投递被判定更旧，静默丢弃。
+                        if matches!(&payload, CapturedPayload::Files(files) if files.internal) {
                             state.sent_peers.extend(&peers);
-                        } else if state.applied_version == Some(state.version) {
-                            let payload = Arc::new(payload);
-                            for peer_id in state.delivery_targets(&peers, Instant::now()) {
-                                if outgoing.contains_key(&peer_id) {
-                                    continue;
+                        } else {
+                            state.observe_fingerprint(captured_fingerprint(&payload));
+                            discard_obsolete_transfers(&mut state, &hub);
+                            if state.applied_version == Some(state.version) {
+                                let payload = Arc::new(payload);
+                                for peer_id in state.delivery_targets(&peers, Instant::now()) {
+                                    if outgoing.contains_key(&peer_id) {
+                                        continue;
+                                    }
+                                    let id = state.next_id();
+                                    let version = state.version;
+                                    let (receipt, receiver) = mpsc::sync_channel(1);
+                                    let cancelled = Arc::new(AtomicBool::new(false));
+                                    let worker_cancelled = cancelled.clone();
+                                    let worker_id = id.clone();
+                                    let payload = payload.clone();
+                                    let hub = &hub;
+                                    crate::i18n::localized!(
+                                        eprintln,
+                                        "sync.sending",
+                                        summary = captured_summary(&payload)
+                                    );
+                                    outgoing.insert(
+                                        peer_id,
+                                        OutgoingSend {
+                                            version,
+                                            id,
+                                            cancelled,
+                                            receipt,
+                                            job: scope.spawn(move || {
+                                                let queued = send_payload(
+                                                    hub,
+                                                    peer_id,
+                                                    &worker_id,
+                                                    version,
+                                                    &payload,
+                                                    &worker_cancelled,
+                                                );
+                                                wait_for_delivery(
+                                                    queued,
+                                                    &receiver,
+                                                    &worker_cancelled,
+                                                )
+                                            }),
+                                        },
+                                    );
                                 }
-                                let id = state.next_id();
-                                let version = state.version;
-                                let (receipt, receiver) = mpsc::sync_channel(1);
-                                let cancelled = Arc::new(AtomicBool::new(false));
-                                let worker_cancelled = cancelled.clone();
-                                let worker_id = id.clone();
-                                let payload = payload.clone();
-                                let hub = &hub;
-                                crate::i18n::localized!(
-                                    eprintln,
-                                    "sync.sending",
-                                    summary = captured_summary(&payload)
-                                );
-                                outgoing.insert(
-                                    peer_id,
-                                    OutgoingSend {
-                                        version,
-                                        id,
-                                        cancelled,
-                                        receipt,
-                                        job: scope.spawn(move || {
-                                            let queued = send_payload(
-                                                hub,
-                                                peer_id,
-                                                &worker_id,
-                                                version,
-                                                &payload,
-                                                &worker_cancelled,
-                                            );
-                                            wait_for_delivery(queued, &receiver, &worker_cancelled)
-                                        }),
-                                    },
-                                );
                             }
                         }
                     }
@@ -1136,16 +1161,20 @@ mod tests {
         assert!(!accept_version(&mut state, &hub, 1, "late", old_version));
         assert_eq!(state.last_fingerprint, Some(2));
 
-        let mut other = SyncState::new([1; 16]);
-        other.observe_fingerprint(3);
-        other.observe_fingerprint(4);
+        // 版本按墙上时钟毫秒比较，同一毫秒的并发复制按设备 ID 决出先后。
+        let concurrent = ClipboardVersion {
+            counter: state.version.counter,
+            origin: [1; 16],
+        };
         assert!(!accept_version(
             &mut state,
             &hub,
             1,
             "concurrent",
-            other.version
+            concurrent
         ));
+        let mut other = SyncState::new([1; 16]);
+        other.version = concurrent;
         assert!(accept_version(&mut other, &hub, 2, "newer", state.version));
         assert_eq!(state.version, other.version);
     }

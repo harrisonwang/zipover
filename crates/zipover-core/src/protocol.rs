@@ -5,7 +5,7 @@ pub(crate) const FRAME_LIMIT: usize = 4 * 1024 * 1024;
 pub(crate) const CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const MAX_TRANSFER_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 pub(crate) const MAX_MANIFEST_ENTRIES: usize = 100_000;
-pub(crate) const PROTOCOL_VERSION: u16 = 3;
+pub(crate) const PROTOCOL_VERSION: u16 = 4;
 
 // Lamport 次序使交叉复制和延迟完成的传输在各设备上得到相同结果。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
