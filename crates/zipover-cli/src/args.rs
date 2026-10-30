@@ -1,3 +1,4 @@
+use crate::tr;
 use anyhow::{Context, Result, anyhow, bail};
 use std::{ffi::OsString, path::PathBuf};
 use zipover_core::SyncOptions;
@@ -32,11 +33,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command>
                 paths.remove(0);
             }
             if paths.is_empty() {
-                localized!(
-                    bail,
-                    "copy 至少需要一个文件或目录路径",
-                    "copy requires at least one file or folder path"
-                )
+                localized!(bail, "args.copy-path-required")
             }
             Ok(Command::Copy(
                 paths.into_iter().map(PathBuf::from).collect(),
@@ -45,11 +42,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command>
         Some("devices") => {
             args.next();
             if args.next().is_some() {
-                localized!(
-                    bail,
-                    "devices 不接受参数",
-                    "devices does not accept arguments"
-                )
+                localized!(bail, "args.devices-no-arguments")
             }
             Ok(Command::Devices)
         }
@@ -57,11 +50,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command>
             args.next();
             let id = next_text(&mut args, "forget")?;
             if args.next().is_some() {
-                localized!(
-                    bail,
-                    "forget 只接受一个设备 ID",
-                    "forget accepts exactly one device ID"
-                )
+                localized!(bail, "args.forget-single-id")
             }
             Ok(Command::Forget(id))
         }
@@ -74,35 +63,22 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command>
                 match arg.to_str() {
                     Some("-h" | "--help") => return Ok(Command::Help),
                     Some("--listen") => {
-                        options.listen = next_text(&mut args, "--listen")?.parse().context(
-                            zipover_core::i18n::text("监听地址无效", "Invalid listen address"),
-                        )?
+                        options.listen = next_text(&mut args, "--listen")?
+                            .parse()
+                            .context(tr("args.invalid-listen"))?
                     }
                     Some("--connect") => options.connect = Some(next_text(&mut args, "--connect")?),
                     Some("--tray") => tray = true,
                     Some("--pair") => code = Some(next_text(&mut args, "--pair")?),
                     Some("--device") => device = Some(next_text(&mut args, "--device")?),
-                    _ => localized!(
-                        bail,
-                        "未知参数：{}",
-                        "Unknown argument: {}",
-                        arg.to_string_lossy()
-                    ),
+                    _ => localized!(bail, "args.unknown", argument = arg.to_string_lossy()),
                 }
             }
             if device.is_some() && code.is_none() {
-                localized!(
-                    bail,
-                    "--device 需要同时提供 --pair 配对码",
-                    "--device requires a --pair code"
-                )
+                localized!(bail, "args.device-requires-code")
             }
             if tray && code.is_some() {
-                localized!(
-                    bail,
-                    "--tray 的配对请在桌面面板中完成，不能同时使用 --pair",
-                    "Pair devices in the desktop app when using --tray; --pair cannot be combined with it"
-                )
+                localized!(bail, "args.tray-pair-conflict")
             }
             Ok(Command::Run {
                 options,
@@ -116,22 +92,13 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command>
 
 fn next_text(args: &mut impl Iterator<Item = OsString>, option: &str) -> Result<String> {
     args.next()
-        .with_context(|| localized!(format, "{option} 缺少参数", "Missing value for {option}"))?
+        .with_context(|| localized!(format, "args.missing-value", option = option))?
         .into_string()
-        .map_err(|_| {
-            localized!(
-                anyhow,
-                "{option} 必须是有效的 UTF-8",
-                "{option} must be valid UTF-8"
-            )
-        })
+        .map_err(|_| localized!(anyhow, "args.invalid-utf8", option = option))
 }
 
-pub(crate) fn usage() -> &'static str {
-    zipover_core::i18n::text(
-        "用法：\n  zipover                      开始同步；首次启动显示配对码\n  zipover --pair <6位数字>      配对并继续同步\n  zipover --tray               启动桌面版\n  zipover devices              查看已配对设备\n  zipover forget <设备ID>       解除配对（先退出同步进程）\n  zipover copy <文件或目录>...\n\n配对成功后，两端自动继续同步，无需重新启动。\n多台设备待配对时，用 --device <设备名或ID> 选择。\n网络参数：--listen <IP:端口> 修改监听，\n--connect <主机:端口> 手动直连（配对后保存设备地址）。",
-        "Usage:\n  zipover                      Start syncing; shows a pairing code on first launch\n  zipover --pair <6-digit code> Pair, then continue syncing\n  zipover --tray               Start the desktop app\n  zipover devices              List paired devices\n  zipover forget <device ID>   Unpair a device (quit syncing first)\n  zipover copy <file or folder>...\n\nBoth computers continue syncing automatically after pairing; no restart is needed.\nUse --device <name or ID> when multiple devices are ready to pair.\nNetwork options: --listen <IP:port> changes the listening address.\n--connect <host:port> connects directly (saves the device address after pairing).",
-    )
+pub(crate) fn usage() -> std::borrow::Cow<'static, str> {
+    tr("args.usage")
 }
 
 #[cfg(test)]

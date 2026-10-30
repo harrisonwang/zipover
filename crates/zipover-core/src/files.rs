@@ -53,7 +53,7 @@ pub(crate) struct CapturedFiles {
 
 pub(crate) fn capture_files(paths: &[PathBuf]) -> Result<CapturedFiles> {
     if paths.is_empty() {
-        crate::i18n::localized!(bail, "复制项目为空", "No items were copied")
+        crate::i18n::localized!(bail, "files.nothing_copied")
     }
 
     let internal = paths.iter().any(|path| is_internal_cache_path(path));
@@ -63,10 +63,7 @@ pub(crate) fn capture_files(paths: &[PathBuf]) -> Result<CapturedFiles> {
     for path in paths {
         let root_name = path
             .file_name()
-            .context(crate::i18n::text(
-                "无法读取复制项目的文件名",
-                "Unable to read the copied item's name",
-            ))?
+            .context(crate::i18n::tr("files.name_unavailable"))?
             .to_owned();
         capture_entry(path, PathBuf::from(root_name), &mut entries, &mut names)?;
     }
@@ -91,37 +88,22 @@ fn capture_entry(
     names: &mut HashSet<Vec<u8>>,
 ) -> Result<()> {
     if entries.len() >= MAX_MANIFEST_ENTRIES {
-        crate::i18n::localized!(
-            bail,
-            "目录项目数量超过限制（最多 {MAX_MANIFEST_ENTRIES} 项）",
-            "The directory exceeds the limit of {MAX_MANIFEST_ENTRIES} items"
-        )
+        crate::i18n::localized!(bail, "files.too_many_items", limit = MAX_MANIFEST_ENTRIES)
     }
 
     let metadata = fs::symlink_metadata(source).with_context(|| {
-        crate::i18n::localized!(
-            format,
-            "读取复制项目失败：{}",
-            "Unable to read copied item: {}",
-            source.display()
-        )
+        crate::i18n::localized!(format, "files.read_item_failed", path = source.display())
     })?;
     if metadata.file_type().is_symlink() {
-        crate::i18n::localized!(
-            bail,
-            "暂不支持符号链接：{}",
-            "Symbolic links are not supported: {}",
-            source.display()
-        )
+        crate::i18n::localized!(bail, "files.symlink_unsupported", path = source.display())
     }
 
     let wire_path = portable_relative_path(&relative)?;
     if !names.insert(path_collision_key(&wire_path)) {
         crate::i18n::localized!(
             bail,
-            "复制项目存在重名路径：{}",
-            "Copied items contain duplicate paths: {}",
-            path_display(&wire_path)
+            "files.duplicate_copied_path",
+            path = path_display(&wire_path)
         )
     }
     let normalized_path = safe_relative_path(&wire_path)?;
@@ -137,9 +119,8 @@ fn capture_entry(
     } else {
         crate::i18n::localized!(
             bail,
-            "暂不支持特殊文件：{}",
-            "Special files are not supported: {}",
-            source.display()
+            "files.special_file_unsupported",
+            path = source.display()
         )
     };
 
@@ -159,18 +140,16 @@ fn capture_entry(
             .with_context(|| {
                 crate::i18n::localized!(
                     format,
-                    "读取目录失败：{}",
-                    "Unable to read directory: {}",
-                    source.display()
+                    "files.read_directory_failed",
+                    path = source.display()
                 )
             })?
             .collect::<std::result::Result<Vec<_>, _>>()
             .with_context(|| {
                 crate::i18n::localized!(
                     format,
-                    "读取目录内容失败：{}",
-                    "Unable to read directory contents: {}",
-                    source.display()
+                    "files.read_directory_contents_failed",
+                    path = source.display()
                 )
             })?;
         children.sort_by_key(|child| child.file_name());
@@ -211,9 +190,8 @@ fn manifest_identity(directory: &Path, entries: &[TransferEntry]) -> Result<u64>
         let metadata = fs::symlink_metadata(&path).with_context(|| {
             crate::i18n::localized!(
                 format,
-                "读取接收文件元数据失败：{}",
-                "Unable to read received file metadata: {}",
-                path.display()
+                "files.read_received_metadata_failed",
+                path = path.display()
             )
         })?;
         modified_nanos(&metadata).hash(&mut hasher);
@@ -246,17 +224,15 @@ fn send_file_transfer_inner(
         .map(|local| local.entry.clone())
         .collect::<Vec<_>>();
     let total_bytes = entries.iter().try_fold(0u64, |total, entry| {
-        total.checked_add(entry.size).context(crate::i18n::text(
-            "文件总大小溢出",
-            "Total file size overflow",
-        ))
+        total
+            .checked_add(entry.size)
+            .context(crate::i18n::tr("files.total_size_overflow"))
     })?;
     if total_bytes > MAX_TRANSFER_BYTES {
         crate::i18n::localized!(
             bail,
-            "文件总大小超过限制（最多 {} GiB）",
-            "Total file size exceeds the limit of {} GiB",
-            MAX_TRANSFER_BYTES / (1024 * 1024 * 1024)
+            "files.total_size_limit",
+            limit = MAX_TRANSFER_BYTES / (1024 * 1024 * 1024)
         )
     }
 
@@ -275,22 +251,20 @@ fn send_file_transfer_inner(
             continue;
         }
 
-        let source = local.source.as_ref().context(crate::i18n::text(
-            "文件来源路径丢失",
-            "The source file path is missing",
-        ))?;
+        let source = local
+            .source
+            .as_ref()
+            .context(crate::i18n::tr("files.source_path_missing"))?;
         crate::i18n::localized!(
             eprintln,
-            "剪贴板同步：正在读取文件 {}",
-            "Clipboard sync: reading file {}",
-            path_display(&local.entry.path)
+            "files.reading",
+            path = path_display(&local.entry.path)
         );
         let before = fs::symlink_metadata(source).with_context(|| {
             crate::i18n::localized!(
                 format,
-                "读取文件元数据失败：{}",
-                "Unable to read file metadata: {}",
-                source.display()
+                "files.read_metadata_failed",
+                path = source.display()
             )
         })?;
         if !before.is_file()
@@ -300,30 +274,19 @@ fn send_file_transfer_inner(
         {
             crate::i18n::localized!(
                 bail,
-                "文件在传输前发生变化：{}",
-                "The file changed before transfer: {}",
-                source.display()
+                "files.changed_before_transfer",
+                path = source.display()
             )
         }
         let mut file = File::open(source).with_context(|| {
-            crate::i18n::localized!(
-                format,
-                "打开文件失败：{}",
-                "Unable to open file: {}",
-                source.display()
-            )
+            crate::i18n::localized!(format, "files.open_failed", path = source.display())
         })?;
         let mut hasher = Sha256::new();
         let mut offset = 0u64;
 
         loop {
             let length = file.read(&mut buffer).with_context(|| {
-                crate::i18n::localized!(
-                    format,
-                    "读取文件失败：{}",
-                    "Unable to read file: {}",
-                    source.display()
-                )
+                crate::i18n::localized!(format, "files.read_failed", path = source.display())
             })?;
             if length == 0 {
                 break;
@@ -331,12 +294,7 @@ fn send_file_transfer_inner(
 
             let next_offset = offset + length as u64;
             if next_offset > local.entry.size {
-                crate::i18n::localized!(
-                    bail,
-                    "文件在传输过程中变大：{}",
-                    "The file grew during transfer: {}",
-                    source.display()
-                )
+                crate::i18n::localized!(bail, "files.grew_during_transfer", path = source.display())
             }
             hasher.update(&buffer[..length]);
             hub.send_to_targets(
@@ -354,17 +312,15 @@ fn send_file_transfer_inner(
         if offset != local.entry.size {
             crate::i18n::localized!(
                 bail,
-                "文件在传输过程中发生变化：{}",
-                "The file changed during transfer: {}",
-                source.display()
+                "files.changed_during_transfer",
+                path = source.display()
             )
         }
         let after = fs::symlink_metadata(source).with_context(|| {
             crate::i18n::localized!(
                 format,
-                "读取文件元数据失败：{}",
-                "Unable to read file metadata: {}",
-                source.display()
+                "files.read_metadata_failed",
+                path = source.display()
             )
         })?;
         if !after.is_file()
@@ -374,9 +330,8 @@ fn send_file_transfer_inner(
         {
             crate::i18n::localized!(
                 bail,
-                "文件在传输过程中发生变化：{}",
-                "The file changed during transfer: {}",
-                source.display()
+                "files.changed_during_transfer",
+                path = source.display()
             )
         }
         let sha256: [u8; 32] = hasher.finalize().into();
@@ -390,7 +345,7 @@ fn send_file_transfer_inner(
         )?;
         file_index = file_index
             .checked_add(1)
-            .context(crate::i18n::text("文件数量溢出", "File count overflow"))?;
+            .context(crate::i18n::tr("files.count_overflow"))?;
     }
 
     hub.send_to_targets(peers, &WireMessage::TransferEnd { id: id.to_string() })
@@ -428,27 +383,18 @@ impl IncomingTransfer {
         entries: Vec<TransferEntry>,
     ) -> Result<Self> {
         if entries.is_empty() {
-            crate::i18n::localized!(bail, "传输清单为空", "The transfer manifest is empty")
+            crate::i18n::localized!(bail, "files.empty_manifest")
         }
         if entries.len() > MAX_MANIFEST_ENTRIES {
-            crate::i18n::localized!(
-                bail,
-                "传输清单项目数量超过限制",
-                "The transfer manifest exceeds the item limit"
-            )
+            crate::i18n::localized!(bail, "files.manifest_item_limit")
         }
         let total_bytes = entries.iter().try_fold(0u64, |total, entry| {
-            total.checked_add(entry.size).context(crate::i18n::text(
-                "传输清单文件大小溢出",
-                "Transfer manifest file size overflow",
-            ))
+            total
+                .checked_add(entry.size)
+                .context(crate::i18n::tr("files.manifest_size_overflow"))
         })?;
         if total_bytes > MAX_TRANSFER_BYTES {
-            crate::i18n::localized!(
-                bail,
-                "传输文件总大小超过限制",
-                "The transfer exceeds the total file size limit"
-            )
+            crate::i18n::localized!(bail, "files.transfer_size_limit")
         }
 
         let directory = env::temp_dir()
@@ -458,9 +404,8 @@ impl IncomingTransfer {
         fs::create_dir_all(&parts_directory).with_context(|| {
             crate::i18n::localized!(
                 format,
-                "创建临时传输目录失败：{}",
-                "Unable to create temporary transfer directory: {}",
-                directory.display()
+                "files.create_transfer_directory_failed",
+                path = directory.display()
             )
         })?;
 
@@ -484,9 +429,8 @@ impl IncomingTransfer {
             if path_kinds.insert(key, entry.kind).is_some() {
                 crate::i18n::localized!(
                     bail,
-                    "传输清单存在重复路径：{}",
-                    "The transfer manifest contains duplicate paths: {}",
-                    path_display(&entry.path)
+                    "files.duplicate_manifest_path",
+                    path = path_display(&entry.path)
                 )
             }
             normalized_paths.push(relative);
@@ -503,9 +447,8 @@ impl IncomingTransfer {
                 if path_kinds.get(&key) == Some(&TransferEntryKind::File) {
                     crate::i18n::localized!(
                         bail,
-                        "传输清单中，文件不能作为目录父级：{}",
-                        "A file cannot be a parent directory in the transfer manifest: {}",
-                        path_display(&entry.path)
+                        "files.file_used_as_directory",
+                        path = path_display(&entry.path)
                     )
                 }
                 ancestor = path.parent();
@@ -527,31 +470,27 @@ impl IncomingTransfer {
                     if entry.size != 0 {
                         crate::i18n::localized!(
                             bail,
-                            "目录大小必须为 0：{}",
-                            "Directory size must be zero: {}",
-                            path_display(&entry.path)
+                            "files.nonzero_directory_size",
+                            path = path_display(&entry.path)
                         )
                     }
                     fs::create_dir_all(&final_path).with_context(|| {
                         crate::i18n::localized!(
                             format,
-                            "创建目录失败：{}",
-                            "Unable to create directory: {}",
-                            final_path.display()
+                            "files.create_directory_failed",
+                            path = final_path.display()
                         )
                     })?;
                 }
                 TransferEntryKind::File => {
-                    let parent = final_path.parent().context(crate::i18n::text(
-                        "接收文件缺少父目录",
-                        "The received file has no parent directory",
-                    ))?;
+                    let parent = final_path
+                        .parent()
+                        .context(crate::i18n::tr("files.parent_missing"))?;
                     fs::create_dir_all(parent).with_context(|| {
                         crate::i18n::localized!(
                             format,
-                            "创建文件父目录失败：{}",
-                            "Unable to create the file's parent directory: {}",
-                            parent.display()
+                            "files.create_parent_failed",
+                            path = parent.display()
                         )
                     })?;
                     let temporary_path = parts_directory.join(format!("{entry_index}.part"));
@@ -569,11 +508,7 @@ impl IncomingTransfer {
         }
 
         if roots.is_empty() {
-            crate::i18n::localized!(
-                bail,
-                "传输清单没有顶层路径",
-                "The transfer manifest has no root paths"
-            )
+            crate::i18n::localized!(bail, "files.manifest_roots_missing")
         }
 
         Ok(Self {
@@ -593,42 +528,26 @@ impl IncomingTransfer {
         bytes: &[u8],
     ) -> Result<()> {
         if bytes.is_empty() || bytes.len() > CHUNK_SIZE {
-            crate::i18n::localized!(
-                bail,
-                "收到的文件分块大小无效",
-                "Invalid received file chunk size"
-            )
+            crate::i18n::localized!(bail, "files.invalid_chunk_size")
         }
         let file = self
             .files
             .get_mut(file_index as usize)
-            .context(crate::i18n::text(
-                "文件分块索引无效",
-                "Invalid file chunk index",
-            ))?;
+            .context(crate::i18n::tr("files.invalid_chunk_index"))?;
         if file.finished {
-            crate::i18n::localized!(
-                bail,
-                "文件已经结束，不能继续写入",
-                "The file is already complete and cannot accept more data"
-            )
+            crate::i18n::localized!(bail, "files.chunk_after_completion")
         }
         if offset != file.received_size {
             crate::i18n::localized!(
                 bail,
-                "文件分块偏移不连续：期望 {}，实际 {}",
-                "Nonsequential file chunk offset: expected {}, received {}",
-                file.received_size,
-                offset
+                "files.nonsequential_offset",
+                expected = file.received_size,
+                received = offset
             )
         }
         let next_size = file.received_size + bytes.len() as u64;
         if next_size > file.expected_size {
-            crate::i18n::localized!(
-                bail,
-                "接收文件大小超过清单声明",
-                "The received file exceeds its declared size"
-            )
+            crate::i18n::localized!(bail, "files.declared_size_exceeded")
         }
 
         if file.file.is_none() {
@@ -640,21 +559,19 @@ impl IncomingTransfer {
                     .with_context(|| {
                         crate::i18n::localized!(
                             format,
-                            "创建临时文件失败：{}",
-                            "Unable to create temporary file: {}",
-                            file.temporary_path.display()
+                            "files.create_temporary_failed",
+                            path = file.temporary_path.display()
                         )
                     })?,
             );
         }
-        let handle = file.file.as_mut().context(crate::i18n::text(
-            "接收文件句柄已关闭",
-            "The received file handle is closed",
-        ))?;
-        handle.write_all(bytes).context(crate::i18n::text(
-            "写入文件分块失败",
-            "Unable to write file chunk",
-        ))?;
+        let handle = file
+            .file
+            .as_mut()
+            .context(crate::i18n::tr("files.handle_closed"))?;
+        handle
+            .write_all(bytes)
+            .context(crate::i18n::tr("files.write_chunk_failed"))?;
         file.hasher.update(bytes);
         file.received_size = next_size;
         Ok(())
@@ -664,26 +581,22 @@ impl IncomingTransfer {
         let file = self
             .files
             .get_mut(file_index as usize)
-            .context(crate::i18n::text(
-                "文件结束索引无效",
-                "Invalid completed file index",
-            ))?;
+            .context(crate::i18n::tr("files.invalid_completion_index"))?;
         if file.finished {
-            crate::i18n::localized!(bail, "文件已经结束", "The file is already complete")
+            crate::i18n::localized!(bail, "files.already_complete")
         }
         if file.received_size != file.expected_size {
             crate::i18n::localized!(
                 bail,
-                "文件大小不匹配：期望 {}，实际 {}",
-                "File size mismatch: expected {}, received {}",
-                file.expected_size,
-                file.received_size
+                "files.size_mismatch",
+                expected = file.expected_size,
+                received = file.received_size
             )
         }
 
         let actual_sha256: [u8; 32] = file.hasher.clone().finalize().into();
         if actual_sha256 != expected_sha256 {
-            crate::i18n::localized!(bail, "SHA-256 校验不匹配", "SHA-256 checksum mismatch")
+            crate::i18n::localized!(bail, "files.checksum_mismatch")
         }
 
         let mut handle = match file.file.take() {
@@ -695,31 +608,27 @@ impl IncomingTransfer {
                 .with_context(|| {
                     crate::i18n::localized!(
                         format,
-                        "创建空文件失败：{}",
-                        "Unable to create empty file: {}",
-                        file.temporary_path.display()
+                        "files.create_empty_failed",
+                        path = file.temporary_path.display()
                     )
                 })?,
         };
-        handle.flush().context(crate::i18n::text(
-            "刷新临时文件失败",
-            "Unable to flush temporary file",
-        ))?;
+        handle
+            .flush()
+            .context(crate::i18n::tr("files.flush_failed"))?;
         drop(handle);
         fs::hard_link(&file.temporary_path, &file.final_path).with_context(|| {
             crate::i18n::localized!(
                 format,
-                "将临时文件提交为最终文件失败：{}",
-                "Unable to commit temporary file to its final path: {}",
-                file.final_path.display()
+                "files.commit_failed",
+                path = file.final_path.display()
             )
         })?;
         fs::remove_file(&file.temporary_path).with_context(|| {
             crate::i18n::localized!(
                 format,
-                "清理临时文件失败：{}",
-                "Unable to remove temporary file: {}",
-                file.temporary_path.display()
+                "files.remove_temporary_failed",
+                path = file.temporary_path.display()
             )
         })?;
         file.finished = true;
@@ -728,11 +637,7 @@ impl IncomingTransfer {
 
     pub(crate) fn finish(mut self) -> Result<FinishedTransfer> {
         if self.files.iter().any(|file| !file.finished) {
-            crate::i18n::localized!(
-                bail,
-                "仍有文件没有完成校验",
-                "Some files have not completed verification"
-            )
+            crate::i18n::localized!(bail, "files.verification_incomplete")
         }
         // 先读取元数据计算指纹，再恢复目录权限，避免无权进入目录时无法完成收尾。
         let contents_directory = self.directory.join("contents");
@@ -745,9 +650,8 @@ impl IncomingTransfer {
             fs::remove_dir_all(&self.parts_directory).with_context(|| {
                 crate::i18n::localized!(
                     format,
-                    "清理临时分块目录失败：{}",
-                    "Unable to remove temporary chunk directory: {}",
-                    self.parts_directory.display()
+                    "files.remove_chunks_failed",
+                    path = self.parts_directory.display()
                 )
             })?;
         }
@@ -769,11 +673,10 @@ impl IncomingTransfer {
         let total_bytes = self.entries.iter().map(|entry| entry.size).sum::<u64>();
         crate::i18n::localized!(
             format,
-            "{} 个文件、{} 个目录（{}）",
-            "{} files, {} folders ({})",
-            file_count,
-            directory_count,
-            format_bytes(total_bytes)
+            "files.summary",
+            files = file_count,
+            folders = directory_count,
+            size = format_bytes(total_bytes)
         )
     }
 }
@@ -810,11 +713,10 @@ pub(crate) fn files_summary(files: &CapturedFiles) -> String {
         .sum::<u64>();
     crate::i18n::localized!(
         format,
-        "{} 个文件、{} 个目录（{}）",
-        "{} files, {} folders ({})",
-        file_count,
-        directory_count,
-        format_bytes(total_bytes)
+        "files.summary",
+        files = file_count,
+        folders = directory_count,
+        size = format_bytes(total_bytes)
     )
 }
 
@@ -823,16 +725,12 @@ pub(crate) fn portable_relative_path(path: &Path) -> Result<Vec<u8>> {
     for component in path.components() {
         let component = os_str_bytes(component.as_os_str());
         if component.is_empty() || component == b"." || component == b".." {
-            crate::i18n::localized!(
-                bail,
-                "复制路径包含无效组件",
-                "The copied path contains an invalid component"
-            )
+            crate::i18n::localized!(bail, "files.invalid_copied_component")
         }
         components.push(portable_component(&component));
     }
     if components.is_empty() {
-        crate::i18n::localized!(bail, "复制路径为空", "The copied path is empty")
+        crate::i18n::localized!(bail, "files.empty_copied_path")
     }
     Ok(components.join(&b'/'))
 }
@@ -859,9 +757,8 @@ fn push_safe_component(
     if component.is_empty() || component == b"." || component == b".." {
         crate::i18n::localized!(
             bail,
-            "传输路径包含无效组件：{}",
-            "The transfer path contains an invalid component: {}",
-            path_display(full_path)
+            "files.invalid_transfer_component",
+            path = path_display(full_path)
         )
     }
     result.push(os_string_from_bytes(&portable_component(component))?);
@@ -974,10 +871,7 @@ fn os_string_from_bytes(value: &[u8]) -> Result<OsString> {
     {
         String::from_utf8(value.to_vec())
             .map(OsString::from)
-            .context(crate::i18n::text(
-                "Windows 无法表示非 UTF-8 文件名",
-                "Windows cannot represent non-UTF-8 filenames",
-            ))
+            .context(crate::i18n::tr("files.non_utf8_windows_name"))
     }
 }
 
@@ -1019,9 +913,8 @@ pub(crate) fn cleanup_stale_cache() {
         if is_old && fs::remove_dir_all(&path).is_ok() {
             crate::i18n::localized!(
                 eprintln,
-                "剪贴板同步：已清理过期临时目录 {}",
-                "Clipboard sync: removed expired temporary directory {}",
-                path.display()
+                "files.removed_expired_directory",
+                path = path.display()
             );
         }
     }
@@ -1052,9 +945,8 @@ fn apply_mode(path: &Path, mode: Option<u32>) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).with_context(|| {
             crate::i18n::localized!(
                 format,
-                "恢复文件权限失败：{}",
-                "Unable to restore file permissions: {}",
-                path.display()
+                "files.restore_permissions_failed",
+                path = path.display()
             )
         })?;
     }

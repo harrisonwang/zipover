@@ -62,27 +62,16 @@ pub struct SyncRuntime {
 impl SyncRuntime {
     pub fn start(options: SyncOptions) -> Result<Self> {
         let store = ConfigStore::load()?;
-        let clipboard = Clipboard::new().context(crate::i18n::text(
-            "访问系统剪贴板失败",
-            "Unable to access the system clipboard",
-        ))?;
+        let clipboard = Clipboard::new().context(crate::i18n::tr("clipboard.unavailable"))?;
         let listener = bind_listener(options.listen).with_context(|| {
-            crate::i18n::localized!(format,
-                "监听 {} 失败，请退出其他 Zipover 进程或使用 --listen 选择地址",
-                "Unable to listen on {}. Quit the other Zipover process or choose an address with --listen",
-                options.listen
-            )
+            crate::i18n::localized!(format, "runtime.listen_failed", address = options.listen)
         })?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
         let discovery = match Discovery::start(&store.config, local_addr) {
             Ok(discovery) => Some(discovery),
             Err(error) => {
-                crate::i18n::localized!(
-                    eprintln,
-                    "自动发现不可用，仍可通过 IP 地址配对或连接已保存的设备：{error:#}",
-                    "Device discovery is unavailable; pair by IP address or connect to saved devices: {error:#}"
-                );
+                crate::i18n::localized!(eprintln, "runtime.discovery_unavailable", error = error : {:#});
                 None
             }
         };
@@ -195,13 +184,7 @@ impl SyncRuntime {
             .take()
             .expect("同步运行时持有剪贴板线程")
             .join()
-            .map_err(|_| {
-                crate::i18n::localized!(
-                    anyhow,
-                    "剪贴板同步线程异常退出",
-                    "The clipboard sync thread stopped unexpectedly"
-                )
-            })?
+            .map_err(|_| crate::i18n::localized!(anyhow, "runtime.clipboard_thread_stopped"))?
     }
 }
 

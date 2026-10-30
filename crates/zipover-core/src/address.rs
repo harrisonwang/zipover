@@ -16,21 +16,14 @@ pub fn parse_pairing_address(value: &str) -> Result<SocketAddr> {
                 .map(|ip| SocketAddr::new(ip, DEFAULT_PORT))
         })
         .or_else(|| scoped_v6(value))
-        .context(crate::i18n::text(
-            "请输入有效的 IP 地址，可附加端口；IPv6 端口写作 [地址]:端口",
-            "Enter a valid IP address, optionally with a port; use [address]:port for IPv6",
-        ))?;
+        .context(crate::i18n::tr("address.invalid_format"))?;
     validate_pairing_address(address)?;
     Ok(address)
 }
 
 pub(crate) fn validate_pairing_address(address: SocketAddr) -> Result<()> {
     if address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast() {
-        crate::i18n::localized!(
-            bail,
-            "请输入设备的单播 IP 地址和非零端口",
-            "Enter the computer's unicast IP address and a nonzero port"
-        );
+        crate::i18n::localized!(bail, "address.unicast_required");
     }
     Ok(())
 }

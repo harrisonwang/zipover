@@ -42,11 +42,10 @@ impl CapturedImage {
     pub(crate) fn summary(&self) -> String {
         crate::i18n::localized!(
             format,
-            "图片 {}x{}（{}）",
-            "Image {}x{} ({})",
-            self.width,
-            self.height,
-            format_bytes(self.bytes.len() as u64)
+            "image.summary",
+            width = self.width,
+            height = self.height,
+            size = format_bytes(self.bytes.len() as u64)
         )
     }
 }
@@ -60,14 +59,8 @@ pub(crate) fn capture_image(
         return Ok(None);
     };
 
-    let width = u32::try_from(image.width).context(crate::i18n::text(
-        "剪贴板图片宽度过大",
-        "The clipboard image is too wide",
-    ))?;
-    let height = u32::try_from(image.height).context(crate::i18n::text(
-        "剪贴板图片高度过大",
-        "The clipboard image is too tall",
-    ))?;
+    let width = u32::try_from(image.width).context(crate::i18n::tr("image.too_wide"))?;
+    let height = u32::try_from(image.height).context(crate::i18n::tr("image.too_tall"))?;
     let raw_fingerprint = image_fingerprint(width, height, image.bytes.as_ref());
     if let Some(cached) = cache
         && cached.raw_fingerprint == raw_fingerprint
@@ -99,14 +92,13 @@ pub(crate) fn send_image_transfer(
     image: &CapturedImage,
 ) -> Result<()> {
     let result = (|| {
-        let size = u64::try_from(image.bytes.len())
-            .context(crate::i18n::text("图片大小溢出", "Image size overflow"))?;
+        let size =
+            u64::try_from(image.bytes.len()).context(crate::i18n::tr("image.size_overflow"))?;
         if size > MAX_IMAGE_TRANSFER_BYTES as u64 {
             crate::i18n::localized!(
                 bail,
-                "图片大小超过限制（最多 {}）",
-                "The image exceeds the size limit of {}",
-                format_bytes(MAX_IMAGE_TRANSFER_BYTES as u64)
+                "image.size_limit",
+                limit = format_bytes(MAX_IMAGE_TRANSFER_BYTES as u64)
             );
         }
         hub.send_to_targets(
@@ -156,23 +148,13 @@ impl IncomingImage {
         expected_size: u64,
     ) -> Result<Self> {
         if width == 0 || height == 0 {
-            crate::i18n::localized!(
-                bail,
-                "图片尺寸不能为空",
-                "Image dimensions must not be zero"
-            )
+            crate::i18n::localized!(bail, "image.zero_dimensions")
         }
         if expected_size == 0 || expected_size > MAX_IMAGE_TRANSFER_BYTES as u64 {
-            crate::i18n::localized!(
-                bail,
-                "图片传输大小超过限制",
-                "The image transfer exceeds the size limit"
-            )
+            crate::i18n::localized!(bail, "image.transfer_size_limit")
         }
-        let capacity = usize::try_from(expected_size).context(crate::i18n::text(
-            "图片大小无法在本机表示",
-            "The image size cannot be represented on this computer",
-        ))?;
+        let capacity = usize::try_from(expected_size)
+            .context(crate::i18n::tr("image.size_unrepresentable"))?;
         Ok(Self {
             fingerprint,
             width,
@@ -185,22 +167,14 @@ impl IncomingImage {
 
     pub(crate) fn accept_chunk(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
         if bytes.is_empty() || bytes.len() > CHUNK_SIZE {
-            crate::i18n::localized!(bail, "图片分块大小无效", "Invalid image chunk size")
+            crate::i18n::localized!(bail, "image.invalid_chunk_size")
         }
         if offset != self.bytes.len() as u64 {
-            crate::i18n::localized!(
-                bail,
-                "图片分块偏移量不连续",
-                "Nonsequential image chunk offset"
-            )
+            crate::i18n::localized!(bail, "image.nonsequential_offset")
         }
         let next = self.bytes.len() as u64 + bytes.len() as u64;
         if next > self.expected_size {
-            crate::i18n::localized!(
-                bail,
-                "图片接收大小超过声明值",
-                "The received image exceeds its declared size"
-            )
+            crate::i18n::localized!(bail, "image.declared_size_exceeded")
         }
         self.bytes.extend_from_slice(bytes);
         self.hasher.update(bytes);
@@ -211,35 +185,22 @@ impl IncomingImage {
         if self.bytes.len() as u64 != self.expected_size {
             crate::i18n::localized!(
                 bail,
-                "图片大小不匹配：期望 {}，实际 {}",
-                "Image size mismatch: expected {}, received {}",
-                format_bytes(self.expected_size),
-                format_bytes(self.bytes.len() as u64)
+                "image.size_mismatch",
+                expected = format_bytes(self.expected_size),
+                received = format_bytes(self.bytes.len() as u64)
             )
         }
         let actual_sha256: [u8; 32] = self.hasher.finalize().into();
         if actual_sha256 != expected_sha256 {
-            crate::i18n::localized!(
-                bail,
-                "图片 SHA-256 校验不匹配",
-                "Image SHA-256 checksum mismatch"
-            )
+            crate::i18n::localized!(bail, "image.checksum_mismatch")
         }
         let actual_fingerprint = image_fingerprint(self.width, self.height, &self.bytes);
         if actual_fingerprint != self.fingerprint {
-            crate::i18n::localized!(
-                bail,
-                "图片 fingerprint 校验不匹配",
-                "Image fingerprint mismatch"
-            )
+            crate::i18n::localized!(bail, "image.fingerprint_mismatch")
         }
         let (decoded_width, decoded_height, _) = decode_png(&self.bytes)?;
         if decoded_width != self.width || decoded_height != self.height {
-            crate::i18n::localized!(
-                bail,
-                "图片尺寸与传输清单不一致",
-                "The image dimensions do not match the transfer manifest"
-            )
+            crate::i18n::localized!(bail, "image.dimensions_mismatch")
         }
         Ok((
             actual_fingerprint,
@@ -260,11 +221,7 @@ pub(crate) fn apply_image(
 ) -> Result<()> {
     let (decoded_width, decoded_height, decoded) = decode_png(bytes)?;
     if decoded_width != width || decoded_height != height {
-        crate::i18n::localized!(
-            bail,
-            "图片尺寸与传输清单不一致",
-            "The image dimensions do not match the transfer manifest"
-        )
+        crate::i18n::localized!(bail, "image.dimensions_mismatch")
     }
     clipboard
         .set_image(ImageData {
@@ -272,7 +229,7 @@ pub(crate) fn apply_image(
             height: decoded_height as usize,
             bytes: Cow::Owned(decoded),
         })
-        .context(crate::i18n::text("写入图片失败", "Unable to write image"))?;
+        .context(crate::i18n::tr("image.write_failed"))?;
     Ok(())
 }
 
@@ -285,36 +242,24 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
                 .and_then(|height| width.checked_mul(height))
         })
         .and_then(|pixels| pixels.checked_mul(4))
-        .context(crate::i18n::text(
-            "图片尺寸过大",
-            "The image dimensions are too large",
-        ))?;
+        .context(crate::i18n::tr("image.dimensions_too_large"))?;
     if rgba.len() != expected {
-        crate::i18n::localized!(
-            bail,
-            "图片像素数据大小不正确",
-            "Incorrect image pixel data size"
-        )
+        crate::i18n::localized!(bail, "image.invalid_pixel_size")
     }
     if expected > MAX_IMAGE_BYTES {
-        crate::i18n::localized!(
-            bail,
-            "图片像素数据超过限制",
-            "The image pixel data exceeds the size limit"
-        )
+        crate::i18n::localized!(bail, "image.pixel_size_limit")
     }
 
     let mut encoded = Vec::new();
     let mut encoder = png::Encoder::new(&mut encoded, width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header().context(crate::i18n::text(
-        "编码图片头失败",
-        "Unable to encode the image header",
-    ))?;
+    let mut writer = encoder
+        .write_header()
+        .context(crate::i18n::tr("image.encode_header_failed"))?;
     writer
         .write_image_data(rgba)
-        .context(crate::i18n::text("编码图片失败", "Unable to encode image"))?;
+        .context(crate::i18n::tr("image.encode_failed"))?;
     drop(writer);
     Ok(encoded)
 }
@@ -322,20 +267,15 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
 fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     let mut decoder = png::Decoder::new(Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::IDENTITY);
-    let mut reader = decoder.read_info().context(crate::i18n::text(
-        "读取图片头失败",
-        "Unable to read the image header",
-    ))?;
+    let mut reader = decoder
+        .read_info()
+        .context(crate::i18n::tr("image.read_header_failed"))?;
     let (decoded_width, decoded_height, color_type, bit_depth) = {
         let info = reader.info();
         (info.width, info.height, info.color_type, info.bit_depth)
     };
     if color_type != png::ColorType::Rgba || bit_depth != png::BitDepth::Eight {
-        crate::i18n::localized!(
-            bail,
-            "图片格式不是 RGBA PNG",
-            "The image format is not RGBA PNG"
-        )
+        crate::i18n::localized!(bail, "image.unsupported_format")
     }
     let expected = usize::try_from(decoded_width)
         .ok()
@@ -345,28 +285,17 @@ fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
                 .and_then(|height| width.checked_mul(height))
         })
         .and_then(|pixels| pixels.checked_mul(4))
-        .context(crate::i18n::text(
-            "图片尺寸过大",
-            "The image dimensions are too large",
-        ))?;
+        .context(crate::i18n::tr("image.dimensions_too_large"))?;
     if expected > MAX_IMAGE_BYTES || reader.output_buffer_size() > MAX_IMAGE_BYTES {
-        crate::i18n::localized!(
-            bail,
-            "图片解码大小超过限制",
-            "The decoded image exceeds the size limit"
-        )
+        crate::i18n::localized!(bail, "image.decoded_size_limit")
     }
 
     let mut decoded = vec![0u8; reader.output_buffer_size()];
     let output = reader
         .next_frame(&mut decoded)
-        .context(crate::i18n::text("解码图片失败", "Unable to decode image"))?;
+        .context(crate::i18n::tr("image.decode_failed"))?;
     if output.buffer_size() != expected {
-        crate::i18n::localized!(
-            bail,
-            "图片像素数据大小不正确",
-            "Incorrect image pixel data size"
-        )
+        crate::i18n::localized!(bail, "image.invalid_pixel_size")
     }
     decoded.truncate(output.buffer_size());
     Ok((decoded_width, decoded_height, decoded))

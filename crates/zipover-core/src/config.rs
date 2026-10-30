@@ -34,17 +34,13 @@ impl DeviceConfig {
                 .with_context(|| {
                     crate::i18n::localized!(
                         format,
-                        "读取设备配置失败：{}",
-                        "Unable to read device settings: {}",
-                        path.display()
+                        "config.read_path_failed",
+                        path = path.display()
                     )
                 })
                 .map(Some),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).context(crate::i18n::text(
-                "读取设备配置失败",
-                "Unable to read device settings",
-            )),
+            Err(error) => Err(error).context(crate::i18n::tr("config.read_failed")),
         }
     }
 
@@ -67,20 +63,18 @@ impl ConfigStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self> {
-        fs::create_dir_all(path.parent().context(crate::i18n::text(
-            "配置目录无效",
-            "Invalid settings directory",
-        ))?)?;
+        fs::create_dir_all(
+            path.parent()
+                .context(crate::i18n::tr("config.invalid_directory"))?,
+        )?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path.with_extension("lock"))?;
-        lock.try_lock().context(crate::i18n::text(
-            "已有 Zipover 使用此配置，请先退出该进程",
-            "Zipover is already using these settings. Quit the other process first.",
-        ))?;
+        lock.try_lock()
+            .context(crate::i18n::tr("config.already_in_use"))?;
         let config = match DeviceConfig::read(&path)? {
             Some(config) => config,
             None => DeviceConfig {
@@ -100,11 +94,7 @@ impl ConfigStore {
 
     pub fn trust(&mut self, mut peer: TrustedPeer) -> Result<()> {
         if peer.id == self.config.id {
-            crate::i18n::localized!(
-                bail,
-                "不能与本机配对",
-                "You cannot pair this computer with itself"
-            )
+            crate::i18n::localized!(bail, "config.self_pairing")
         }
         let mut next = self.config.clone();
         if let Some(saved) = next.peers.iter().find(|saved| saved.id == peer.id) {
@@ -128,10 +118,10 @@ impl ConfigStore {
     }
 
     fn save(&self, config: &DeviceConfig) -> Result<()> {
-        let parent = self.path.parent().context(crate::i18n::text(
-            "配置目录无效",
-            "Invalid settings directory",
-        ))?;
+        let parent = self
+            .path
+            .parent()
+            .context(crate::i18n::tr("config.invalid_directory"))?;
         fs::create_dir_all(parent)?;
         let temporary = self.path.with_extension("tmp");
         let mut options = OpenOptions::new();
@@ -145,21 +135,14 @@ impl ConfigStore {
         file.write_all(&serde_json::to_vec_pretty(config)?)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(temporary, &self.path).context(crate::i18n::text(
-            "保存设备配置失败",
-            "Unable to save device settings",
-        ))
+        fs::rename(temporary, &self.path).context(crate::i18n::tr("config.save_failed"))
     }
 }
 
 pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N]> {
     let mut bytes = [0; N];
     getrandom::fill(&mut bytes).map_err(|error| {
-        crate::i18n::localized!(
-            anyhow,
-            "生成随机密钥失败：{error}",
-            "Unable to generate a random key: {error}"
-        )
+        crate::i18n::localized!(anyhow, "config.random_key_failed", error = error)
     })?;
     Ok(bytes)
 }
@@ -179,10 +162,7 @@ fn config_dir() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|path| PathBuf::from(path).join(".config")));
     Ok(base
-        .context(crate::i18n::text(
-            "无法确定用户配置目录",
-            "Unable to locate the user settings directory",
-        ))?
+        .context(crate::i18n::tr("config.user_directory_missing"))?
         .join("zipover"))
 }
 
