@@ -136,6 +136,7 @@ fn lan_round_trip() {
                             id,
                             &format!("test-{}", timestamp_nanos()),
                             entries,
+                            &[],
                         )?)
                     }
                     WireMessage::TransferChunk {

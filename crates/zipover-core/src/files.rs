@@ -371,6 +371,7 @@ pub(crate) struct IncomingTransfer {
     files: Vec<IncomingFile>,
     pub(crate) roots: Vec<PathBuf>,
     committed: bool,
+    lock: Option<File>,
 }
 
 struct IncomingFile {
@@ -387,6 +388,7 @@ pub(crate) struct FinishedTransfer {
     pub(crate) fingerprint: u64,
     pub(crate) roots: Vec<PathBuf>,
     directory: PathBuf,
+    lock: Option<File>,
 }
 
 impl IncomingTransfer {
@@ -394,6 +396,7 @@ impl IncomingTransfer {
         id: String,
         cache_scope: &str,
         entries: Vec<TransferEntry>,
+        protected: &[PathBuf],
     ) -> Result<Self> {
         if entries.is_empty() {
             crate::i18n::localized!(bail, "files.empty_manifest")
@@ -412,15 +415,33 @@ impl IncomingTransfer {
 
         let cache = cache_directory();
         ensure_private_directory(&cache)?;
+        let _cache_lock = lock_cache(&cache)?;
+        maintain_cache_locked(
+            &cache,
+            protected,
+            total_bytes,
+            CACHE_MAX_BYTES,
+            SystemTime::now(),
+        )?;
         // 随机后缀加独占创建，避免重用远端提供的消息 ID 所对应的旧目录。
         let directory = cache.join(format!(
             "{}-{}",
             transfer_component(&format!("{cache_scope}-{id}")),
             hex::encode(crate::config::random_bytes::<16>()?)
         ));
-        create_private_directory(&directory)?;
+        create_private_directory(&directory).with_context(|| {
+            crate::i18n::localized!(
+                format,
+                "files.private_cache_required",
+                path = directory.display()
+            )
+        })?;
         let parts_directory = directory.join(".parts");
         let result = (|| {
+            // 根目录锁覆盖目录创建与租约建立之间的窗口；进程退出后租约由系统释放。
+            let lock = create_private_file(&directory.join(".lock"))?;
+            lock.lock()
+                .context(crate::i18n::tr("files.cache_lock_failed"))?;
             create_private_directory(&parts_directory).with_context(|| {
                 crate::i18n::localized!(
                     format,
@@ -431,7 +452,7 @@ impl IncomingTransfer {
 
             let mut size_file = create_private_file(&directory.join(".size"))?;
             write!(size_file, "{total_bytes}")?;
-            Self::start_inner(directory.clone(), parts_directory, entries)
+            Self::start_inner(directory.clone(), parts_directory, entries, lock)
         })();
         if result.is_err() {
             let _ = fs::remove_dir_all(&directory);
@@ -447,6 +468,7 @@ impl IncomingTransfer {
         directory: PathBuf,
         parts_directory: PathBuf,
         entries: Vec<TransferEntry>,
+        lock: File,
     ) -> Result<Self> {
         let mut normalized_paths = Vec::with_capacity(entries.len());
         let mut path_kinds = HashMap::with_capacity(entries.len());
@@ -545,6 +567,7 @@ impl IncomingTransfer {
             files,
             roots,
             committed: false,
+            lock: Some(lock),
         })
     }
 
@@ -679,6 +702,7 @@ impl IncomingTransfer {
             fingerprint: local_fingerprint,
             roots: std::mem::take(&mut self.roots),
             directory: std::mem::take(&mut self.directory),
+            lock: self.lock.take(),
         })
     }
 
@@ -691,13 +715,17 @@ impl Drop for IncomingTransfer {
     fn drop(&mut self) {
         if !self.committed {
             self.files.clear();
+            let _cache_lock = lock_cache(&cache_directory()).ok();
+            self.lock.take();
             let _ = remove_cached_directory(&self.directory);
         }
     }
 }
 
 impl FinishedTransfer {
-    pub(crate) fn cleanup(self) {
+    pub(crate) fn cleanup(mut self) {
+        let _cache_lock = lock_cache(&cache_directory()).ok();
+        self.lock.take();
         let _ = remove_cached_directory(&self.directory);
     }
 }
@@ -878,28 +906,26 @@ fn cache_directory() -> PathBuf {
     env::temp_dir().join(name)
 }
 
-fn create_private_directory(path: &Path) -> Result<()> {
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
     let builder = &mut fs::DirBuilder::new();
     #[cfg(unix)]
     builder.mode(0o700);
-    builder.create(path).with_context(|| {
-        crate::i18n::localized!(
-            format,
-            "files.private_cache_required",
-            path = path.display()
-        )
-    })
+    builder.create(path)
 }
 
 fn ensure_private_directory(path: &Path) -> Result<()> {
     match create_private_directory(path) {
         Ok(()) => {}
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .map(std::io::Error::kind)
-                == Some(std::io::ErrorKind::AlreadyExists) => {}
-        Err(error) => return Err(error),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                crate::i18n::localized!(
+                    format,
+                    "files.private_cache_required",
+                    path = path.display()
+                )
+            });
+        }
     }
     validate_private_directory(path)
 }
@@ -933,19 +959,30 @@ pub(crate) fn cleanup_cache(protected: &[PathBuf]) {
     }
 }
 
-pub(crate) fn reserve_cache_space(protected: &[PathBuf], bytes: u64) -> Result<()> {
-    let directory = cache_directory();
-    ensure_private_directory(&directory)?;
-    maintain_cache(
-        &directory,
-        protected,
-        bytes,
-        CACHE_MAX_BYTES,
-        SystemTime::now(),
-    )
+fn lock_cache(directory: &Path) -> Result<File> {
+    validate_private_directory(directory)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let lock = options.open(directory.join(".lock"))?;
+    lock.lock()
+        .context(crate::i18n::tr("files.cache_lock_failed"))?;
+    Ok(lock)
 }
 
 fn maintain_cache(
+    directory: &Path,
+    protected: &[PathBuf],
+    incoming_bytes: u64,
+    limit: u64,
+    now: SystemTime,
+) -> Result<()> {
+    let _cache_lock = lock_cache(directory)?;
+    maintain_cache_locked(directory, protected, incoming_bytes, limit, now)
+}
+
+fn maintain_cache_locked(
     directory: &Path,
     protected: &[PathBuf],
     incoming_bytes: u64,
@@ -972,11 +1009,25 @@ fn maintain_cache(
         let completed = fs::symlink_metadata(path.join(".complete"))
             .ok()
             .filter(|metadata| metadata.is_file());
+        let active = match OpenOptions::new().write(true).open(path.join(".lock")) {
+            Ok(lock) => match lock.try_lock() {
+                Ok(()) => false,
+                Err(fs::TryLockError::WouldBlock) => true,
+                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
+        // 无租约的未完成目录属于崩溃残留，无需等待七天，也不依赖 .size 完整性。
+        if !is_protected && !active && completed.is_none() && remove_cached_directory(&path).is_ok()
+        {
+            continue;
+        }
         let modified = completed.as_ref().unwrap_or(&metadata).modified()?;
         let expired = now
             .duration_since(modified)
             .is_ok_and(|age| age >= CACHE_MAX_AGE);
-        if !is_protected && expired && remove_cached_directory(&path).is_ok() {
+        if !is_protected && !active && expired && remove_cached_directory(&path).is_ok() {
             continue;
         }
         // .size 存储声明的总大小，也为尚未完成的传输预留空间。
@@ -988,7 +1039,7 @@ fn maintain_cache(
             .and_then(|size| size.parse::<u64>().ok())
             .unwrap_or_else(|| limit.saturating_add(1));
         total += u128::from(size);
-        if !is_protected && completed.is_some() {
+        if !is_protected && !active && completed.is_some() {
             candidates.push((modified, path, size));
         }
     }
@@ -1141,8 +1192,8 @@ mod tests {
             mode: None,
         };
         let first =
-            IncomingTransfer::start("repeated".into(), "test", vec![entry.clone()]).unwrap();
-        let second = IncomingTransfer::start("repeated".into(), "test", vec![entry]).unwrap();
+            IncomingTransfer::start("repeated".into(), "test", vec![entry.clone()], &[]).unwrap();
+        let second = IncomingTransfer::start("repeated".into(), "test", vec![entry], &[]).unwrap();
         assert_ne!(first.directory, second.directory);
         assert!(first.directory.is_dir());
         assert!(second.directory.is_dir());
@@ -1185,7 +1236,8 @@ mod tests {
             size: 7,
             mode: Some(0o644),
         };
-        let mut incoming = IncomingTransfer::start("private".into(), "test", vec![entry]).unwrap();
+        let mut incoming =
+            IncomingTransfer::start("private".into(), "test", vec![entry], &[]).unwrap();
         let directory = incoming.directory.clone();
         for path in [
             cache_directory(),
@@ -1279,6 +1331,34 @@ mod tests {
         assert!(maintain_cache(&root.0, std::slice::from_ref(&path), 1, 10, now).is_err());
         maintain_cache(&root.0, &[], 1, 10, now).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn crashed_transfers_do_not_block_new_files_or_remove_live_cache() {
+        let root = TestDirectory::new();
+        let now = SystemTime::now();
+        let clipboard = cached_transfer(&root.0, "clipboard", 2, Some(now));
+        let active = cached_transfer(&root.0, "active", 3, None);
+        let lease = create_private_file(&active.join(".lock")).unwrap();
+        lease.lock().unwrap();
+        for (name, record) in [
+            ("missing", None),
+            ("corrupt", Some("invalid")),
+            ("reserved", Some("32")),
+        ] {
+            let abandoned = root.0.join(name);
+            create_private_directory(&abandoned).unwrap();
+            if let Some(record) = record {
+                fs::write(abandoned.join(".size"), record).unwrap();
+            }
+            maintain_cache(&root.0, std::slice::from_ref(&clipboard), 4, 10, now).unwrap();
+            assert!(!abandoned.exists());
+            assert!(active.exists());
+            assert!(clipboard.exists());
+        }
+        drop(lease);
+        maintain_cache(&root.0, &[clipboard], 4, 10, now).unwrap();
+        assert!(!active.exists());
     }
 
     #[cfg(unix)]

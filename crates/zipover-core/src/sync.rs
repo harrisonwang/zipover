@@ -1,8 +1,6 @@
 use crate::{
     clipboard::{CaptureCache, CapturedPayload, apply_payload, capture_payload, set_file_list},
-    files::{
-        IncomingTransfer, cleanup_cache, files_summary, reserve_cache_space, send_file_transfer,
-    },
+    files::{IncomingTransfer, cleanup_cache, files_summary, send_file_transfer},
     image::{IncomingImage, send_image_transfer},
     protocol::{ClipboardPayload, WireMessage},
     transport::{IncomingEvent, PeerHub},
@@ -363,9 +361,8 @@ fn handle_incoming_event(
                 crate::i18n::localized!(eprintln, "sync.file_size_limit");
                 return Ok(());
             }
-            reserve_cache_space(&protected_cache_paths(clipboard, state)?, transfer_size)?;
             let cache_scope = format!("{}-{peer_id}", state.origin);
-            let transfer = IncomingTransfer::start(id, &cache_scope, entries).map_err(|error| {
+            let transfer = IncomingTransfer::start(id, &cache_scope, entries, &protected_cache_paths(clipboard, state)?).map_err(|error| {
                 crate::i18n::localized!(anyhow, "sync.file_transfer_rejected", error = error : {:#})
             })?;
             crate::i18n::localized!(
@@ -754,7 +751,7 @@ mod tests {
             mode: files::file_mode(&fs::metadata(env::temp_dir()).unwrap()),
         };
         let mut transfer =
-            IncomingTransfer::start(format!("test-{}", timestamp_nanos()), "0", vec![entry])
+            IncomingTransfer::start(format!("test-{}", timestamp_nanos()), "0", vec![entry], &[])
                 .unwrap();
         transfer.accept_chunk(0, 0, b"hello world").unwrap();
         transfer
@@ -784,7 +781,7 @@ mod tests {
                 mode: None,
             });
             let mut transfer =
-                IncomingTransfer::start(format!("parts-{}", timestamp_nanos()), "0", entries)
+                IncomingTransfer::start(format!("parts-{}", timestamp_nanos()), "0", entries, &[])
                     .unwrap();
             transfer.accept_chunk(0, 0, b"payload").unwrap();
             transfer

@@ -186,5 +186,6 @@
   "image.read_failed": "Unable to read the clipboard image",
   "files.private_cache_required": "File cache must be a private directory owned by the current user: %{path}",
   "files.cache_size_limit": "The file cache exceeds its %{limit} limit; replace the clipboard contents or wait for active transfers to finish",
-  "files.read_clipboard_before_cleanup_failed": "Unable to read the clipboard before managing the file cache: %{error}"
+  "files.read_clipboard_before_cleanup_failed": "Unable to read the clipboard before managing the file cache: %{error}",
+  "files.cache_lock_failed": "Failed to lock the file cache"
 }
