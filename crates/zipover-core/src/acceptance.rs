@@ -74,7 +74,7 @@ fn lan_round_trip() {
             drop(state);
             thread::sleep(Duration::from_millis(100));
         }
-        println!("PASS {role} pairing: mDNS, numeric code and persisted trust");
+        println!("PASS {role} pairing: numeric code and persisted trust");
         for round in 0..2 {
             let deadline = Instant::now() + Duration::from_secs(30);
             let peers = loop {
@@ -170,17 +170,12 @@ fn lan_round_trip() {
                         image.as_mut().unwrap().accept_chunk(offset, &bytes)?
                     }
                     WireMessage::ImageEnd { sha256, .. } => {
-                        let (_, payload) = image.take().unwrap().finish(sha256)?;
-                        let ClipboardPayload::Image {
-                            width,
-                            height,
-                            bytes,
-                        } = payload
-                        else {
-                            panic!()
-                        };
-                        assert_eq!((width, height), (640, 480));
-                        assert_eq!(sha2::Sha256::digest(bytes)[..], sha256);
+                        let (_, pixels) = image.take().unwrap().finish(sha256)?;
+                        assert_eq!((pixels.width, pixels.height), (640, 480));
+                        assert_eq!(
+                            sha2::Sha256::digest(&pixels.bytes),
+                            sha2::Sha256::digest(image::test_image_pixels())
+                        );
                         got_image = true;
                     }
                     _ => bail!("unexpected fixture message"),

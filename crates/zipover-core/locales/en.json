@@ -181,5 +181,10 @@
   "transport.unpaired": "The device is no longer paired",
   "transport.connected": "Clipboard sync: encrypted connection to %{name} (%{device})",
   "transport.send_failed": "Clipboard sync: unable to send data: %{error}",
-  "transport.invalid_message": "Clipboard sync: invalid message: %{error}"
+  "transport.invalid_message": "Clipboard sync: invalid message: %{error}",
+  "clipboard.resolve_path_failed": "Unable to resolve copied path: %{path}",
+  "image.read_failed": "Unable to read the clipboard image",
+  "files.private_cache_required": "File cache must be a private directory owned by the current user: %{path}",
+  "files.cache_size_limit": "The file cache exceeds its %{limit} limit; replace the clipboard contents or wait for active transfers to finish",
+  "files.read_clipboard_before_cleanup_failed": "Unable to read the clipboard before managing the file cache: %{error}"
 }

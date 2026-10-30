@@ -52,8 +52,8 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arboard"
-version = "3.6.1"
-source = "git+https://github.com/harrisonwang/arboard.git?rev=3a8ac4af91254af3a5ac8abca6bb3fc0b43470ef#3a8ac4af91254af3a5ac8abca6bb3fc0b43470ef"
+version = "3.7.0"
+source = "git+https://github.com/1Password/arboard.git?rev=e8ccf3ec25afe3dcdf626459de33b0498ddcc3ca#e8ccf3ec25afe3dcdf626459de33b0498ddcc3ca"
 dependencies = [
  "clipboard-win",
  "image",
@@ -65,7 +65,7 @@ dependencies = [
  "objc2-foundation",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
  "wl-clipboard-rs",
  "x11rb",
 ]
@@ -1920,6 +1920,7 @@ dependencies = [
  "mdns-sd",
  "png 0.17.16",
  "rust-i18n",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

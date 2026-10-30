@@ -15,7 +15,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use super::transport::PeerHub;
 use crate::{
@@ -24,6 +24,7 @@ use crate::{
 };
 const CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const CACHE_DIRECTORY_NAME: &str = "zipover-sync";
+const CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) enum TransferEntryKind {
@@ -69,6 +70,10 @@ pub(crate) fn capture_files(paths: &[PathBuf]) -> Result<CapturedFiles> {
     }
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // 本地身份必须区分不同来源的同名文件，即使它们保留了相同的元数据。
+    for path in paths {
+        path.canonicalize()?.hash(&mut hasher);
+    }
     for local in &entries {
         local.entry.hash(&mut hasher);
         local.modified_nanos.hash(&mut hasher);
@@ -167,23 +172,31 @@ fn capture_entry(
 }
 
 fn is_internal_cache_path(path: &Path) -> bool {
-    let cache_root = env::temp_dir().join(CACHE_DIRECTORY_NAME);
-    if path.starts_with(&cache_root) {
-        return true;
-    }
-
-    // macOS 可能把 /var 规范化为 /private/var，比较规范化后的路径才能识别缓存。
-    let Some(canonical_path) = path.canonicalize().ok() else {
-        return false;
-    };
-    let Some(canonical_root) = cache_root.canonicalize().ok() else {
-        return false;
-    };
-    canonical_path.starts_with(canonical_root)
+    // 旧缓存仍可能被系统剪贴板引用，也应阻止回传。
+    [
+        cache_directory(),
+        env::temp_dir().join(CACHE_DIRECTORY_NAME),
+    ]
+    .iter()
+    .any(|root| {
+        path.starts_with(root)
+            || path
+                .canonicalize()
+                .ok()
+                .zip(root.canonicalize().ok())
+                .is_some_and(|(path, root)| path.starts_with(root))
+    })
 }
 
-fn manifest_identity(directory: &Path, entries: &[TransferEntry]) -> Result<u64> {
+fn manifest_identity(
+    directory: &Path,
+    roots: &[PathBuf],
+    entries: &[TransferEntry],
+) -> Result<u64> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for root in roots {
+        root.canonicalize()?.hash(&mut hasher);
+    }
     for entry in entries {
         entry.hash(&mut hasher);
         let path = directory.join(safe_relative_path(&entry.path)?);
@@ -397,23 +410,37 @@ impl IncomingTransfer {
             crate::i18n::localized!(bail, "files.transfer_size_limit")
         }
 
-        let directory = env::temp_dir()
-            .join(CACHE_DIRECTORY_NAME)
-            .join(transfer_component(&format!("{cache_scope}-{id}")));
+        let cache = cache_directory();
+        ensure_private_directory(&cache)?;
+        // 随机后缀加独占创建，避免重用远端提供的消息 ID 所对应的旧目录。
+        let directory = cache.join(format!(
+            "{}-{}",
+            transfer_component(&format!("{cache_scope}-{id}")),
+            hex::encode(crate::config::random_bytes::<16>()?)
+        ));
+        create_private_directory(&directory)?;
         let parts_directory = directory.join(".parts");
-        fs::create_dir_all(&parts_directory).with_context(|| {
-            crate::i18n::localized!(
-                format,
-                "files.create_transfer_directory_failed",
-                path = directory.display()
-            )
-        })?;
+        let result = (|| {
+            create_private_directory(&parts_directory).with_context(|| {
+                crate::i18n::localized!(
+                    format,
+                    "files.create_transfer_directory_failed",
+                    path = directory.display()
+                )
+            })?;
 
-        let result = Self::start_inner(directory.clone(), parts_directory, entries);
+            let mut size_file = create_private_file(&directory.join(".size"))?;
+            write!(size_file, "{total_bytes}")?;
+            Self::start_inner(directory.clone(), parts_directory, entries)
+        })();
         if result.is_err() {
             let _ = fs::remove_dir_all(&directory);
         }
         result
+    }
+
+    pub(crate) fn cache_directory(&self) -> &Path {
+        &self.directory
     }
 
     fn start_inner(
@@ -551,19 +578,13 @@ impl IncomingTransfer {
         }
 
         if file.file.is_none() {
-            file.file = Some(
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&file.temporary_path)
-                    .with_context(|| {
-                        crate::i18n::localized!(
-                            format,
-                            "files.create_temporary_failed",
-                            path = file.temporary_path.display()
-                        )
-                    })?,
-            );
+            file.file = Some(create_private_file(&file.temporary_path).with_context(|| {
+                crate::i18n::localized!(
+                    format,
+                    "files.create_temporary_failed",
+                    path = file.temporary_path.display()
+                )
+            })?);
         }
         let handle = file
             .file
@@ -601,17 +622,13 @@ impl IncomingTransfer {
 
         let mut handle = match file.file.take() {
             Some(handle) => handle,
-            None => OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&file.temporary_path)
-                .with_context(|| {
-                    crate::i18n::localized!(
-                        format,
-                        "files.create_empty_failed",
-                        path = file.temporary_path.display()
-                    )
-                })?,
+            None => create_private_file(&file.temporary_path).with_context(|| {
+                crate::i18n::localized!(
+                    format,
+                    "files.create_empty_failed",
+                    path = file.temporary_path.display()
+                )
+            })?,
         };
         handle
             .flush()
@@ -641,7 +658,7 @@ impl IncomingTransfer {
         }
         // 先读取元数据计算指纹，再恢复目录权限，避免无权进入目录时无法完成收尾。
         let contents_directory = self.directory.join("contents");
-        let local_fingerprint = manifest_identity(&contents_directory, &self.entries)?;
+        let local_fingerprint = manifest_identity(&contents_directory, &self.roots, &self.entries)?;
         for entry in self.entries.iter().rev() {
             let path = contents_directory.join(safe_relative_path(&entry.path)?);
             apply_mode(&path, entry.mode)?;
@@ -655,6 +672,8 @@ impl IncomingTransfer {
                 )
             })?;
         }
+        // 完成时间与容量信息保留在私有父目录中，不受源文件权限影响。
+        create_private_file(&self.directory.join(".complete"))?;
         self.committed = true;
         Ok(FinishedTransfer {
             fingerprint: local_fingerprint,
@@ -672,14 +691,14 @@ impl Drop for IncomingTransfer {
     fn drop(&mut self) {
         if !self.committed {
             self.files.clear();
-            let _ = fs::remove_dir_all(&self.directory);
+            let _ = remove_cached_directory(&self.directory);
         }
     }
 }
 
 impl FinishedTransfer {
     pub(crate) fn cleanup(self) {
-        let _ = fs::remove_dir_all(self.directory);
+        let _ = remove_cached_directory(&self.directory);
     }
 }
 pub(crate) fn files_summary(files: &CapturedFiles) -> String {
@@ -848,27 +867,169 @@ fn transfer_component(value: &str) -> String {
     format!("{prefix}-{:016x}", hasher.finish())
 }
 
-pub(crate) fn cleanup_stale_cache() {
-    let directory = env::temp_dir().join(CACHE_DIRECTORY_NAME);
-    let Ok(entries) = fs::read_dir(&directory) else {
-        return;
-    };
-    let now = SystemTime::now();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_old = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .and_then(|modified| now.duration_since(modified).map_err(std::io::Error::other))
-            .map(|age| age >= CACHE_MAX_AGE)
-            .unwrap_or(false);
-        if is_old && fs::remove_dir_all(&path).is_ok() {
-            crate::i18n::localized!(
-                eprintln,
-                "files.removed_expired_directory",
-                path = path.display()
-            );
+fn cache_directory() -> PathBuf {
+    #[cfg(unix)]
+    let name = format!(
+        "{CACHE_DIRECTORY_NAME}-{}",
+        rustix::process::geteuid().as_raw()
+    );
+    #[cfg(not(unix))]
+    let name = CACHE_DIRECTORY_NAME;
+    env::temp_dir().join(name)
+}
+
+fn create_private_directory(path: &Path) -> Result<()> {
+    let builder = &mut fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path).with_context(|| {
+        crate::i18n::localized!(
+            format,
+            "files.private_cache_required",
+            path = path.display()
+        )
+    })
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    match create_private_directory(path) {
+        Ok(()) => {}
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind)
+                == Some(std::io::ErrorKind::AlreadyExists) => {}
+        Err(error) => return Err(error),
+    }
+    validate_private_directory(path)
+}
+
+fn validate_private_directory(path: &Path) -> Result<()> {
+    // symlink_metadata 不跟随预先放置的链接，也不修复其他用户创建的目录。
+    let metadata = fs::symlink_metadata(path)?;
+    let private = metadata.is_dir();
+    #[cfg(unix)]
+    let private = private
+        && metadata.uid() == rustix::process::geteuid().as_raw()
+        && metadata.permissions().mode() & 0o077 == 0;
+    if !private {
+        crate::i18n::localized!(bail, "files.private_cache_required", path = path.display());
+    }
+    Ok(())
+}
+
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
+pub(crate) fn cleanup_cache(protected: &[PathBuf]) {
+    let directory = cache_directory();
+    if directory.try_exists().unwrap_or(false) {
+        let _ = maintain_cache(&directory, protected, 0, CACHE_MAX_BYTES, SystemTime::now());
+    }
+}
+
+pub(crate) fn reserve_cache_space(protected: &[PathBuf], bytes: u64) -> Result<()> {
+    let directory = cache_directory();
+    ensure_private_directory(&directory)?;
+    maintain_cache(
+        &directory,
+        protected,
+        bytes,
+        CACHE_MAX_BYTES,
+        SystemTime::now(),
+    )
+}
+
+fn maintain_cache(
+    directory: &Path,
+    protected: &[PathBuf],
+    incoming_bytes: u64,
+    limit: u64,
+    now: SystemTime,
+) -> Result<()> {
+    validate_private_directory(directory)?;
+    let protected = protected
+        .iter()
+        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    let mut total = u128::from(incoming_bytes);
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_dir() {
+            continue;
         }
+        let path = entry.path().canonicalize()?;
+        let is_protected = protected
+            .iter()
+            .any(|keep| keep.starts_with(&path) || path.starts_with(keep));
+        let completed = fs::symlink_metadata(path.join(".complete"))
+            .ok()
+            .filter(|metadata| metadata.is_file());
+        let modified = completed.as_ref().unwrap_or(&metadata).modified()?;
+        let expired = now
+            .duration_since(modified)
+            .is_ok_and(|age| age >= CACHE_MAX_AGE);
+        if !is_protected && expired && remove_cached_directory(&path).is_ok() {
+            continue;
+        }
+        // .size 存储声明的总大小，也为尚未完成的传输预留空间。
+        // 损坏的记录按超过配额处理，不能将未知占用误算为零。
+        let size = fs::symlink_metadata(path.join(".size"))
+            .ok()
+            .filter(|metadata| metadata.is_file() && metadata.len() <= 20)
+            .and_then(|_| fs::read_to_string(path.join(".size")).ok())
+            .and_then(|size| size.parse::<u64>().ok())
+            .unwrap_or_else(|| limit.saturating_add(1));
+        total += u128::from(size);
+        if !is_protected && completed.is_some() {
+            candidates.push((modified, path, size));
+        }
+    }
+    candidates.sort_by_key(|(modified, _, _)| *modified);
+    for (_, path, size) in candidates {
+        if total <= u128::from(limit) {
+            break;
+        }
+        if remove_cached_directory(&path).is_ok() {
+            total -= u128::from(size);
+        }
+    }
+    if total > u128::from(limit) {
+        crate::i18n::localized!(bail, "files.cache_size_limit", limit = format_bytes(limit));
+    }
+    Ok(())
+}
+
+fn remove_cached_directory(path: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => return Ok(()),
+        #[cfg(unix)]
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(error) => return Err(error),
+    }
+    // 源目录可能为只读或不可遍历；删除缓存时恢复目录的用户权限，不跟随链接。
+    #[cfg(unix)]
+    fn unlock_directories(path: &Path) -> std::io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            fs::set_permissions(path, fs::Permissions::from_mode(metadata.mode() | 0o700))?;
+            for entry in fs::read_dir(path)? {
+                unlock_directories(&entry?.path())?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        unlock_directories(path)?;
+        fs::remove_dir_all(path)
     }
 }
 
@@ -913,6 +1074,243 @@ fn apply_mode(_path: &Path, _mode: Option<u32>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let path = env::temp_dir().join(format!(
+                "zipover-cache-test-{}",
+                hex::encode(crate::config::random_bytes::<16>().unwrap())
+            ));
+            create_private_directory(&path).unwrap();
+            Self(path.canonicalize().unwrap())
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = remove_cached_directory(&self.0);
+        }
+    }
+
+    fn cached_transfer(
+        root: &Path,
+        name: &str,
+        size: u64,
+        completed_at: Option<SystemTime>,
+    ) -> PathBuf {
+        let path = root.join(name);
+        create_private_directory(&path).unwrap();
+        write!(create_private_file(&path.join(".size")).unwrap(), "{size}").unwrap();
+        if let Some(completed_at) = completed_at {
+            create_private_file(&path.join(".complete"))
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(completed_at))
+                .unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn distinct_sources_with_identical_file_metadata_have_distinct_identities() {
+        let root = TestDirectory::new();
+        let modified = SystemTime::now() - Duration::from_secs(60);
+        let paths = [root.0.join("a"), root.0.join("b")].map(|directory| {
+            fs::create_dir(&directory).unwrap();
+            directory.join("same.txt")
+        });
+        for (path, contents) in paths.iter().zip([b"first", b"other"]) {
+            let mut file = File::create(path).unwrap();
+            file.write_all(contents).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        }
+        let first = capture_files(&paths[..1]).unwrap().identity;
+        let other = capture_files(&paths[1..]).unwrap().identity;
+        assert_ne!(first, other);
+        assert_eq!(first, capture_files(&paths[..1]).unwrap().identity);
+    }
+
+    #[test]
+    fn repeated_transfer_ids_do_not_reuse_cache_directories() {
+        let entry = TransferEntry {
+            path: b"empty".to_vec(),
+            kind: TransferEntryKind::File,
+            size: 0,
+            mode: None,
+        };
+        let first =
+            IncomingTransfer::start("repeated".into(), "test", vec![entry.clone()]).unwrap();
+        let second = IncomingTransfer::start("repeated".into(), "test", vec![entry]).unwrap();
+        assert_ne!(first.directory, second.directory);
+        assert!(first.directory.is_dir());
+        assert!(second.directory.is_dir());
+    }
+
+    #[test]
+    fn private_cache_refuses_existing_files() {
+        let root = TestDirectory::new();
+        let path = root.0.join("file");
+        fs::write(&path, b"preserve").unwrap();
+        assert!(ensure_private_directory(&path).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"preserve");
+        ensure_private_directory(&root.0).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_cache_refuses_symlinks_and_shared_permissions() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new();
+        let shared = root.0.join("shared");
+        create_private_directory(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_private_directory(&shared).is_err());
+        assert_eq!(fs::metadata(&shared).unwrap().mode() & 0o777, 0o755);
+
+        let link = root.0.join("link");
+        symlink(&root.0, &link).unwrap();
+        assert!(ensure_private_directory(&link).is_err());
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receiving_files_stays_private_before_and_after_restoring_source_permissions() {
+        let entry = TransferEntry {
+            path: b"sample.txt".to_vec(),
+            kind: TransferEntryKind::File,
+            size: 7,
+            mode: Some(0o644),
+        };
+        let mut incoming = IncomingTransfer::start("private".into(), "test", vec![entry]).unwrap();
+        let directory = incoming.directory.clone();
+        for path in [
+            cache_directory(),
+            directory.clone(),
+            incoming.parts_directory.clone(),
+        ] {
+            assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o700);
+        }
+        incoming.accept_chunk(0, 0, b"payload").unwrap();
+        assert_eq!(
+            fs::metadata(&incoming.files[0].temporary_path)
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        incoming
+            .finish_file(0, Sha256::digest(b"payload").into())
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&incoming.roots[0]).unwrap().mode() & 0o777,
+            0o600
+        );
+        let finished = incoming.finish().unwrap();
+        assert_eq!(
+            fs::metadata(&finished.roots[0]).unwrap().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            finished.fingerprint,
+            capture_files(&finished.roots).unwrap().identity
+        );
+        assert!(capture_files(&finished.roots).unwrap().internal);
+        assert_eq!(fs::read_to_string(directory.join(".size")).unwrap(), "7");
+        assert!(directory.join(".complete").is_file());
+        finished.cleanup();
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn cache_quota_evicts_oldest_completed_transfer_and_reserves_incoming_space() {
+        let root = TestDirectory::new();
+        let now = SystemTime::now();
+        let older = cached_transfer(&root.0, "older", 6, Some(now - Duration::from_secs(2)));
+        let newer = cached_transfer(&root.0, "newer", 6, Some(now));
+        let active = cached_transfer(&root.0, "active", 2, None);
+        maintain_cache(&root.0, std::slice::from_ref(&active), 4, 12, now).unwrap();
+        assert!(!older.exists());
+        assert!(newer.exists());
+        assert!(active.exists());
+    }
+
+    #[test]
+    fn cache_quota_rejects_new_transfer_without_deleting_clipboard_or_active_files() {
+        let root = TestDirectory::new();
+        let now = SystemTime::now();
+        let clipboard = cached_transfer(&root.0, "clipboard", 7, Some(now));
+        let copied_file = clipboard.join("file.txt");
+        fs::write(&copied_file, b"keep").unwrap();
+        let active = cached_transfer(&root.0, "active", 3, None);
+        assert!(
+            maintain_cache(&root.0, &[copied_file.clone(), active.clone()], 1, 10, now).is_err()
+        );
+        assert_eq!(fs::read(copied_file).unwrap(), b"keep");
+        assert!(active.exists());
+    }
+
+    #[test]
+    fn expiry_cleans_abandoned_transfers_and_protects_clipboard_references() {
+        let root = TestDirectory::new();
+        let now = SystemTime::now();
+        let keep = cached_transfer(&root.0, "clipboard", 2, Some(now));
+        let expired = cached_transfer(&root.0, "expired", 2, Some(now));
+        let abandoned = cached_transfer(&root.0, "abandoned", 2, None);
+        let active = cached_transfer(&root.0, "active", 2, None);
+        let future = now + CACHE_MAX_AGE + Duration::from_secs(1);
+        maintain_cache(&root.0, &[keep.clone(), active.clone()], 0, 10, future).unwrap();
+        assert!(keep.exists());
+        assert!(active.exists());
+        assert!(!expired.exists());
+        assert!(!abandoned.exists());
+    }
+
+    #[test]
+    fn corrupt_size_record_is_not_counted_as_empty() {
+        let root = TestDirectory::new();
+        let now = SystemTime::now();
+        let path = cached_transfer(&root.0, "invalid", 7, Some(now));
+        fs::write(path.join(".size"), "invalid").unwrap();
+        assert!(maintain_cache(&root.0, std::slice::from_ref(&path), 1, 10, now).is_err());
+        maintain_cache(&root.0, &[], 1, 10, now).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_cleanup_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDirectory::new();
+        let outside = TestDirectory::new();
+        let target = cached_transfer(&outside.0, "outside", 7, Some(SystemTime::now()));
+        symlink(&target, root.0.join("link")).unwrap();
+        maintain_cache(&root.0, &[], 0, 0, SystemTime::now() + CACHE_MAX_AGE).unwrap();
+        assert!(target.join(".size").is_file());
+        assert!(
+            fs::symlink_metadata(root.0.join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_cleanup_handles_restrictive_directory_permissions() {
+        let root = TestDirectory::new();
+        let path = cached_transfer(&root.0, "restricted", 7, Some(SystemTime::now()));
+        fs::create_dir(path.join("nested")).unwrap();
+        fs::write(path.join("nested/file.txt"), b"payload").unwrap();
+        fs::set_permissions(path.join("nested"), fs::Permissions::from_mode(0o000)).unwrap();
+        maintain_cache(&root.0, &[], 0, 0, SystemTime::now()).unwrap();
+        assert!(!path.exists());
+    }
 
     #[test]
     fn relative_paths_preserve_mixed_separators_and_portable_names() {

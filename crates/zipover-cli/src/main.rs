@@ -33,8 +33,12 @@ fn run() -> Result<()> {
         args::Command::Help => println!("{}", args::usage()),
         args::Command::Version => println!("zipover {}", env!("CARGO_PKG_VERSION")),
         args::Command::Copy(paths) => {
+            #[cfg(not(target_os = "linux"))]
             let count = paths.len();
+            #[cfg(target_os = "linux")]
+            localized!(eprintln, "copy.keep-running");
             zipover_core::copy_paths(paths)?;
+            #[cfg(not(target_os = "linux"))]
             localized!(println, "copy.completed", count = count);
         }
         args::Command::Devices => {

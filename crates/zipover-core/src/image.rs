@@ -5,7 +5,7 @@ use std::{borrow::Cow, io::Cursor, sync::Arc};
 
 use super::transport::PeerHub;
 use crate::{
-    protocol::{CHUNK_SIZE, ClipboardPayload, WireMessage},
+    protocol::{CHUNK_SIZE, WireMessage},
     sync::format_bytes,
 };
 
@@ -54,9 +54,16 @@ pub(crate) fn capture_image(
     clipboard: &mut Clipboard,
     cache: &mut Option<CachedImage>,
 ) -> Result<Option<CapturedImage>> {
-    let Ok(image) = clipboard.get_image() else {
-        *cache = None;
-        return Ok(None);
+    let image = match clipboard.get_image() {
+        Ok(image) => image,
+        Err(arboard::Error::ContentNotAvailable) => {
+            *cache = None;
+            return Ok(None);
+        }
+        Err(error) => {
+            *cache = None;
+            return Err(error).context(crate::i18n::tr("image.read_failed"));
+        }
     };
 
     let width = u32::try_from(image.width).context(crate::i18n::tr("image.too_wide"))?;
@@ -150,6 +157,9 @@ impl IncomingImage {
         if width == 0 || height == 0 {
             crate::i18n::localized!(bail, "image.zero_dimensions")
         }
+        if rgba_size(width, height)? > MAX_IMAGE_BYTES {
+            crate::i18n::localized!(bail, "image.pixel_size_limit")
+        }
         if expected_size == 0 || expected_size > MAX_IMAGE_TRANSFER_BYTES as u64 {
             crate::i18n::localized!(bail, "image.transfer_size_limit")
         }
@@ -181,7 +191,7 @@ impl IncomingImage {
         Ok(())
     }
 
-    pub(crate) fn finish(self, expected_sha256: [u8; 32]) -> Result<(u64, ClipboardPayload)> {
+    pub(crate) fn finish(self, expected_sha256: [u8; 32]) -> Result<(u64, ImageData<'static>)> {
         if self.bytes.len() as u64 != self.expected_size {
             crate::i18n::localized!(
                 bail,
@@ -198,16 +208,16 @@ impl IncomingImage {
         if actual_fingerprint != self.fingerprint {
             crate::i18n::localized!(bail, "image.fingerprint_mismatch")
         }
-        let (decoded_width, decoded_height, _) = decode_png(&self.bytes)?;
+        let (decoded_width, decoded_height, decoded) = decode_png(&self.bytes)?;
         if decoded_width != self.width || decoded_height != self.height {
             crate::i18n::localized!(bail, "image.dimensions_mismatch")
         }
         Ok((
             actual_fingerprint,
-            ClipboardPayload::Image {
-                width: self.width,
-                height: self.height,
-                bytes: self.bytes,
+            ImageData {
+                width: decoded_width as usize,
+                height: decoded_height as usize,
+                bytes: Cow::Owned(decoded),
             },
         ))
     }
@@ -233,8 +243,8 @@ pub(crate) fn apply_image(
     Ok(())
 }
 
-fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
-    let expected = usize::try_from(width)
+fn rgba_size(width: u32, height: u32) -> Result<usize> {
+    usize::try_from(width)
         .ok()
         .and_then(|width| {
             usize::try_from(height)
@@ -242,7 +252,11 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
                 .and_then(|height| width.checked_mul(height))
         })
         .and_then(|pixels| pixels.checked_mul(4))
-        .context(crate::i18n::tr("image.dimensions_too_large"))?;
+        .context(crate::i18n::tr("image.dimensions_too_large"))
+}
+
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
+    let expected = rgba_size(width, height)?;
     if rgba.len() != expected {
         crate::i18n::localized!(bail, "image.invalid_pixel_size")
     }
@@ -277,15 +291,7 @@ fn decode_png(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     if color_type != png::ColorType::Rgba || bit_depth != png::BitDepth::Eight {
         crate::i18n::localized!(bail, "image.unsupported_format")
     }
-    let expected = usize::try_from(decoded_width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(decoded_height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .and_then(|pixels| pixels.checked_mul(4))
-        .context(crate::i18n::tr("image.dimensions_too_large"))?;
+    let expected = rgba_size(decoded_width, decoded_height)?;
     if expected > MAX_IMAGE_BYTES || reader.output_buffer_size() > MAX_IMAGE_BYTES {
         crate::i18n::localized!(bail, "image.decoded_size_limit")
     }
@@ -315,15 +321,7 @@ fn image_fingerprint(width: u32, height: u32, bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 pub(crate) fn test_image() -> CapturedImage {
-    let mut seed = 0x12345678u32;
-    let pixels: Vec<u8> = (0..640 * 480 * 4)
-        .map(|_| {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            seed as u8
-        })
-        .collect();
+    let pixels = test_image_pixels();
     let bytes: Arc<[u8]> = encode_png(640, 480, &pixels).unwrap().into();
     CapturedImage {
         fingerprint: image_fingerprint(640, 480, &bytes),
@@ -331,6 +329,19 @@ pub(crate) fn test_image() -> CapturedImage {
         height: 480,
         bytes,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_image_pixels() -> Vec<u8> {
+    let mut seed = 0x12345678u32;
+    (0..640 * 480 * 4)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -378,22 +389,10 @@ mod tests {
                 .unwrap();
         }
         let sha256: [u8; 32] = Sha256::digest(&encoded).into();
-        let (received_fingerprint, payload) = incoming.finish(sha256).unwrap();
+        let (received_fingerprint, image) = incoming.finish(sha256).unwrap();
         assert_eq!(received_fingerprint, fingerprint);
-        match payload {
-            ClipboardPayload::Image {
-                width: received_width,
-                height: received_height,
-                bytes,
-            } => {
-                assert_eq!(
-                    (received_width, received_height),
-                    (width as u32, height as u32)
-                );
-                assert_eq!(bytes, encoded);
-            }
-            ClipboardPayload::Text(_) => panic!("图片传输返回了文本"),
-        }
+        assert_eq!((image.width, image.height), (width, height));
+        assert_eq!(image.bytes.as_ref(), pixels);
     }
 
     #[test]
@@ -404,5 +403,33 @@ mod tests {
         incoming.accept_chunk(0, &encoded).unwrap();
         let sha256: [u8; 32] = Sha256::digest(&encoded).into();
         assert!(incoming.finish(sha256).is_err());
+    }
+
+    #[test]
+    fn incoming_image_limits_dimensions_before_allocating_transfer_buffer() {
+        assert!(IncomingImage::start(0, 0, 1, 1).is_err());
+        assert!(IncomingImage::start(0, u32::MAX, u32::MAX, 1).is_err());
+        assert!(IncomingImage::start(0, (MAX_IMAGE_BYTES / 4 + 1) as u32, 1, 1).is_err());
+        assert!(IncomingImage::start(0, 1, 1, MAX_IMAGE_TRANSFER_BYTES as u64 + 1).is_err());
+    }
+
+    #[test]
+    fn incoming_image_checks_png_dimensions_after_authentication() {
+        let encoded = encode_png(1, 1, &[1, 2, 3, 255]).unwrap();
+        // 发送方能为尺寸不符的 PNG 提供匹配哈希，因此仍须检查 PNG 自身的尺寸。
+        let fingerprint = image_fingerprint(2, 1, &encoded);
+        let mut incoming = IncomingImage::start(fingerprint, 2, 1, encoded.len() as u64).unwrap();
+        incoming.accept_chunk(0, &encoded).unwrap();
+        assert!(incoming.finish(Sha256::digest(&encoded).into()).is_err());
+    }
+
+    #[test]
+    fn incoming_image_rejects_corrupt_png_with_matching_hashes() {
+        let encoded = encode_png(1, 1, &[1, 2, 3, 255]).unwrap();
+        let truncated = &encoded[..encoded.len() / 2];
+        let fingerprint = image_fingerprint(1, 1, truncated);
+        let mut incoming = IncomingImage::start(fingerprint, 1, 1, truncated.len() as u64).unwrap();
+        incoming.accept_chunk(0, truncated).unwrap();
+        assert!(incoming.finish(Sha256::digest(truncated).into()).is_err());
     }
 }

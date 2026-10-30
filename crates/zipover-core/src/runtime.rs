@@ -1,7 +1,6 @@
 use crate::{
     config::{ConfigStore, DeviceConfig, DeviceId},
     discovery::Discovery,
-    files::cleanup_stale_cache,
     pairing::{JoinProgress, Pairing, SharedPairing},
     sync::clipboard_loop,
     transport::{PeerHub, network_loop},
@@ -91,7 +90,6 @@ impl SyncRuntime {
             );
         }));
         let clipboard_thread = {
-            cleanup_stale_cache();
             let hub = hub.clone();
             Some(thread::spawn(move || clipboard_loop(clipboard, hub, rx)))
         };

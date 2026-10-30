@@ -181,5 +181,10 @@
   "transport.unpaired": "设备已解除配对",
   "transport.connected": "剪贴板同步：已加密连接 %{name}（%{device}）",
   "transport.send_failed": "剪贴板同步：发送数据失败：%{error}",
-  "transport.invalid_message": "剪贴板同步：无效消息：%{error}"
+  "transport.invalid_message": "剪贴板同步：无效消息：%{error}",
+  "clipboard.resolve_path_failed": "无法解析复制路径：%{path}",
+  "image.read_failed": "读取剪贴板图片失败",
+  "files.private_cache_required": "文件缓存必须是当前用户拥有的私有目录：%{path}",
+  "files.cache_size_limit": "文件缓存超出 %{limit} 限制；请替换剪贴板内容或等待正在进行的传输完成",
+  "files.read_clipboard_before_cleanup_failed": "管理文件缓存前无法读取剪贴板：%{error}"
 }

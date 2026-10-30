@@ -24,5 +24,6 @@
   "args.tray-pair-conflict": "--tray 的配对请在桌面面板中完成，不能同时使用 --pair",
   "args.missing-value": "%{option} 缺少参数",
   "args.invalid-utf8": "%{option} 必须是有效的 UTF-8",
-  "args.usage": "用法：\n  zipover                      开始同步；首次启动显示配对码\n  zipover --pair <6位数字>      配对并继续同步\n  zipover --tray               启动桌面版\n  zipover devices              查看已配对设备\n  zipover forget <设备ID>       解除配对（先退出同步进程）\n  zipover copy <文件或目录>...\n\n配对成功后，两端自动继续同步，无需重新启动。\n多台设备待配对时，用 --device <设备名或ID> 选择。\n网络参数：--listen <IP:端口> 修改监听，\n--connect <主机:端口> 手动直连（配对后保存设备地址）。"
+  "args.usage": "用法：\n  zipover                      开始同步；首次启动显示配对码\n  zipover --pair <6位数字>      配对并继续同步\n  zipover --tray               启动桌面版\n  zipover devices              查看已配对设备\n  zipover forget <设备ID>       解除配对（先退出同步进程）\n  zipover copy <文件或目录>...\n\n配对成功后，两端自动继续同步，无需重新启动。\n多台设备待配对时，用 --device <设备名或ID> 选择。\n网络参数：--listen <IP:端口> 修改监听，\n--connect <主机:端口> 手动直连（配对后保存设备地址）。\nLinux 上的 copy 会保持运行，直到剪贴板被其他内容替换；Ctrl+C 可取消。",
+  "copy.keep-running": "请保持此命令运行，以便粘贴。复制其他内容后命令自动退出；Ctrl+C 可取消，但可能使刚复制的文件列表失效。"
 }

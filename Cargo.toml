@@ -15,7 +15,9 @@ png = "0.17"
 rust-i18n = "4.2.4"
 
 [patch.crates-io]
-arboard = { git = "https://github.com/harrisonwang/arboard.git", rev = "3a8ac4af91254af3a5ac8abca6bb3fc0b43470ef" }
+# GNOME file clipboard support (#232) was merged after v3.7.0.
+# Remove this patch once a crates.io release includes that change.
+arboard = { git = "https://github.com/1Password/arboard.git", rev = "e8ccf3ec25afe3dcdf626459de33b0498ddcc3ca" }
 
 [profile.release]
 lto = "thin"

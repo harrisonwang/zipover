@@ -33,6 +33,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--host', default='hp')
     parser.add_argument('--remote-dir', default='/tmp/zipover-acceptance')
+    parser.add_argument('--connect', metavar='MAC_IP:PORT', help='Pair and reconnect by IP instead of discovering this Mac with mDNS')
     args = parser.parse_args()
     stamp = str(int(time.time()))
     artifacts = ROOT / 'target' / 'lan-acceptance' / stamp
@@ -50,6 +51,8 @@ def main():
     prefix = 'cd ' + remote_dir + ' && PATH="$HOME/.cargo/bin:$PATH" '
     remote_test = test_executable(ssh(prefix + 'cargo test --locked -p zipover-core --lib --no-run --message-format=json', capture_output=True).stdout)
     remote_env = 'ZIPOVER_CONFIG_DIR=' + shlex.quote(remote_config) + ' ZIPOVER_TEST_ROLE=hp '
+    if args.connect:
+        remote_env += 'ZIPOVER_TEST_CONNECT=' + shlex.quote(args.connect) + ' '
     processes = []
     logs = []
     reader = None
@@ -90,8 +93,9 @@ def main():
         assert remote_saved['peers'][0]['id'] == local_config['id']
         assert local_config['peers'][0]['key'] == remote_saved['peers'][0]['key']
         del local_config, remote_saved
-        print('PASS: Mac ↔ HP automatic discovery and persistent pairing', flush=True)
-        result = {'result': 'PASS', 'hosts': ['macOS', args.host], 'pairing': 'mDNS, six-digit SPAKE2 pairing, persisted both sides', 'transport': ['bidirectional UTF-8 text', '2 MiB file', 'nested Unicode directory', 'empty file', 'PNG', 'disconnect and automatic reconnect'], 'clipboard': 'synthetic; physical clipboard untouched', 'remote_config': remote_config}
+        mode = 'direct IP' if args.connect else 'mDNS discovery'
+        print(f'PASS: Mac ↔ {args.host} {mode} and persistent pairing', flush=True)
+        result = {'result': 'PASS', 'hosts': ['macOS', args.host], 'pairing': f'{mode}, six-digit SPAKE2 pairing, persisted both sides', 'transport': ['bidirectional UTF-8 text', '2 MiB file', 'nested Unicode directory', 'empty file', 'PNG', 'disconnect and automatic reconnect'], 'clipboard': 'synthetic; physical clipboard untouched', 'remote_config': remote_config}
         (artifacts / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
         print('PASS: bidirectional text, image, file, directory and automatic reconnect', flush=True)
     finally:
