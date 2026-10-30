@@ -19,7 +19,7 @@ Copy text, images, files, or folders on one computer and paste them on another. 
 
 ## Install
 
-Download **Zipover Desktop 1.0.0** from [zipover.app/download](https://zipover.app/download/). That page lists Mac Apple Silicon/Intel, Windows x64 and Linux x64 packages, installation instructions and current signing limitations. You can also install Desktop using the package-manager commands below. The CLI is available separately.
+Download **Zipover Desktop 1.1.0** from [zipover.app/download](https://zipover.app/download/). That page lists Mac Apple Silicon/Intel, Windows x64 and Linux x64 packages, installation instructions and current signing limitations. You can also install Desktop using the package-manager commands below. The CLI is available separately.
 
 ### macOS
 

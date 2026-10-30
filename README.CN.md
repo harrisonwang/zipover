@@ -19,7 +19,7 @@
 
 ## 安装
 
-从 [zipover.app/cn/download](https://zipover.app/cn/download/) 下载 **Zipover Desktop 1.0.0**。页面提供 Mac Apple Silicon / Intel、Windows x64、Linux x64 安装包及首次启动、签名限制说明。也可使用以下包管理器命令安装 Desktop；CLI 可按后文说明单独安装。
+从 [zipover.app/cn/download](https://zipover.app/cn/download/) 下载 **Zipover Desktop 1.1.0**。页面提供 Mac Apple Silicon / Intel、Windows x64、Linux x64 安装包及首次启动、签名限制说明。也可使用以下包管理器命令安装 Desktop；CLI 可按后文说明单独安装。
 
 ### macOS
 
