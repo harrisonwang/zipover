@@ -7,7 +7,7 @@ pub(crate) const MAX_TRANSFER_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 pub(crate) const MAX_MANIFEST_ENTRIES: usize = 100_000;
 pub(crate) const PROTOCOL_VERSION: u16 = 4;
 
-// Lamport 次序使交叉复制和延迟完成的传输在各设备上得到相同结果。
+// 按墙上时钟与已知版本生成递增计数，同值时按设备 ID 排序，使各端一致淘汰旧传输。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct ClipboardVersion {
     pub counter: u64,

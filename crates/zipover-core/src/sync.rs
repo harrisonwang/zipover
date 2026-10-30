@@ -129,7 +129,8 @@ impl SyncState {
         self.last_fingerprint = Some(fingerprint);
     }
 
-    /// 单人跨机使用按墙上时钟毫秒定先后，重启与离线都不会让版本倒退。
+    /// 用墙上时钟比较跨机复制，并保证当前进程已知版本之后的本地复制递增。
+    /// 跨设备的实际先后仍依赖系统校时，时钟回拨后重启不保证单调。
     fn next_counter(&self) -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -152,6 +153,15 @@ impl SyncState {
             self.last_send_error = None;
             self.last_receive_error = None;
         }
+    }
+
+    /// 自写缓存不算本地复制；返回值表示该载荷是否可作为本地内容发送。
+    fn observe_local_payload(&mut self, payload: &CapturedPayload) -> bool {
+        if matches!(payload, CapturedPayload::Files(files) if files.internal) {
+            return false;
+        }
+        self.observe_fingerprint(captured_fingerprint(payload));
+        true
     }
 
     fn delivery_targets(&self, peers: &[u64], now: Instant) -> Vec<u64> {
@@ -262,7 +272,7 @@ pub(crate) fn clipboard_loop(
                             | WireMessage::ImageEnd { .. }
                     ) && let Ok(Some(payload)) = capture_payload(&mut clipboard, &mut cache)
                     {
-                        state.observe_fingerprint(captured_fingerprint(&payload));
+                        state.observe_local_payload(&payload);
                         discard_obsolete_transfers(&mut state, &hub);
                     }
                     let id = message_id(message).to_owned();
@@ -311,12 +321,7 @@ pub(crate) fn clipboard_loop(
                 match capture_payload(&mut clipboard, &mut cache) {
                     Ok(Some(payload)) => {
                         state.last_capture_error = None;
-                        // 自己写回剪贴板的缓存文件不是用户新复制的内容。推进版本会让
-                        // 对端下一次投递被判定更旧，静默丢弃。
-                        if matches!(&payload, CapturedPayload::Files(files) if files.internal) {
-                            state.sent_peers.extend(&peers);
-                        } else {
-                            state.observe_fingerprint(captured_fingerprint(&payload));
+                        if state.observe_local_payload(&payload) {
                             discard_obsolete_transfers(&mut state, &hub);
                             if state.applied_version == Some(state.version) {
                                 let payload = Arc::new(payload);
@@ -363,6 +368,8 @@ pub(crate) fn clipboard_loop(
                                     );
                                 }
                             }
+                        } else {
+                            state.sent_peers.extend(&peers);
                         }
                     }
                     Ok(None) => {
@@ -593,7 +600,7 @@ fn handle_incoming_event(
     }
     match message {
         WireMessage::Clipboard { id, version, text } => {
-            if !valid_message_id(&id) || !accept_version(state, hub, peer_id, &id, version) {
+            if !accept_version(state, hub, peer_id, &id, version) {
                 return Ok(());
             }
             let fingerprint = text_fingerprint(&text);
@@ -612,7 +619,7 @@ fn handle_incoming_event(
             version,
             entries,
         } => {
-            if !valid_message_id(&id) || !accept_version(state, hub, peer_id, &id, version) {
+            if !accept_version(state, hub, peer_id, &id, version) {
                 return Ok(());
             }
             let key = SessionKey::new(peer_id, id.clone());
@@ -659,9 +666,6 @@ fn handle_incoming_event(
             offset,
             bytes,
         } => {
-            if !valid_message_id(&id) {
-                return Ok(());
-            }
             let key = SessionKey::new(peer_id, id);
             let Some(active) = state.active_transfers.get_mut(&key) else {
                 return Ok(());
@@ -678,9 +682,6 @@ fn handle_incoming_event(
             file_index,
             sha256,
         } => {
-            if !valid_message_id(&id) {
-                return Ok(());
-            }
             let key = SessionKey::new(peer_id, id);
             let Some(active) = state.active_transfers.get_mut(&key) else {
                 return Ok(());
@@ -693,9 +694,6 @@ fn handle_incoming_event(
             }
         }
         WireMessage::TransferEnd { id } => {
-            if !valid_message_id(&id) {
-                return Ok(());
-            }
             let key = SessionKey::new(peer_id, id.clone());
             let Some(active) = state.active_transfers.remove(&key) else {
                 crate::i18n::localized!(eprintln, "sync.file_transfer_missing", id = id);
@@ -734,7 +732,7 @@ fn handle_incoming_event(
             height,
             size,
         } => {
-            if !valid_message_id(&id) || !accept_version(state, hub, peer_id, &id, version) {
+            if !accept_version(state, hub, peer_id, &id, version) {
                 return Ok(());
             }
             let key = SessionKey::new(peer_id, id.clone());
@@ -770,9 +768,6 @@ fn handle_incoming_event(
             );
         }
         WireMessage::ImageChunk { id, offset, bytes } => {
-            if !valid_message_id(&id) {
-                return Ok(());
-            }
             let key = SessionKey::new(peer_id, id);
             let Some(active) = state.active_images.get_mut(&key) else {
                 return Ok(());
@@ -785,9 +780,6 @@ fn handle_incoming_event(
             }
         }
         WireMessage::ImageEnd { id, sha256 } => {
-            if !valid_message_id(&id) {
-                return Ok(());
-            }
             let key = SessionKey::new(peer_id, id.clone());
             let Some(active) = state.active_images.remove(&key) else {
                 crate::i18n::localized!(eprintln, "sync.image_transfer_missing", id = id);
@@ -1046,6 +1038,127 @@ mod tests {
             };
             assert_eq!(fs::read(received).unwrap(), b"payload");
             finished.cleanup();
+        }
+    }
+
+    #[test]
+    fn foreign_file_mode_cache_resampling_preserves_remote_version() {
+        // 跨平台权限字段不同会改变回采样指纹，但收到的缓存仍属于同一次远端复制。
+        let bytes = b"cross-platform cache payload";
+        let entry = TransferEntry {
+            path: b"foreign-mode.txt".to_vec(),
+            kind: files::TransferEntryKind::File,
+            size: bytes.len() as u64,
+            mode: if cfg!(unix) { None } else { Some(0o600) },
+        };
+        let mut transfer = IncomingTransfer::start(
+            format!("regression-{}", timestamp_nanos()),
+            "foreign-mode",
+            vec![entry],
+            &[],
+        )
+        .unwrap();
+        transfer.accept_chunk(0, 0, bytes).unwrap();
+        transfer
+            .finish_file(0, Sha256::digest(bytes).into())
+            .unwrap();
+        let finished = transfer.finish().unwrap();
+        let received_fingerprint = finished.fingerprint;
+        let captured = capture_files(&finished.roots);
+        finished.cleanup();
+        let captured = captured.unwrap();
+        assert!(captured.internal);
+        assert_ne!(captured.identity, received_fingerprint);
+
+        let payload = CapturedPayload::Files(Arc::new(captured));
+        let hub = PeerHub::default();
+        let mut state = SyncState::new([2; 16]);
+        let remote_version = ClipboardVersion {
+            counter: 1,
+            origin: [1; 16],
+        };
+        assert!(accept_version(
+            &mut state,
+            &hub,
+            1,
+            "received",
+            remote_version
+        ));
+        mark_remote_applied(&mut state, received_fingerprint, 1, remote_version);
+
+        assert!(!state.observe_local_payload(&payload));
+        assert_eq!(state.version, remote_version);
+        assert_eq!(state.applied_version, Some(remote_version));
+        assert_eq!(state.last_fingerprint, Some(received_fingerprint));
+        assert!(accept_version(
+            &mut state,
+            &hub,
+            1,
+            "next",
+            ClipboardVersion {
+                counter: 2,
+                ..remote_version
+            },
+        ));
+    }
+
+    #[test]
+    #[ignore = "需要隔离的系统剪贴板会话"]
+    fn invalid_message_ids_leave_receiver_state_unchanged() {
+        // 仅构造入口所需的句柄；非法消息必须在写入系统剪贴板或创建传输前返回。
+        let mut clipboard = Clipboard::new().unwrap();
+        let hub = PeerHub::default();
+        for id in [String::new(), "x".repeat(MAX_MESSAGE_ID_LEN + 1)] {
+            let mut state = SyncState::new([2; 16]);
+            state.observe_fingerprint(42);
+            let initial_version = state.version;
+            let version = ClipboardVersion {
+                counter: initial_version.counter + 1,
+                origin: [1; 16],
+            };
+            for message in [
+                WireMessage::TransferStart {
+                    id: id.clone(),
+                    version,
+                    entries: vec![TransferEntry {
+                        path: b"invalid-id.txt".to_vec(),
+                        kind: files::TransferEntryKind::File,
+                        size: 1,
+                        mode: None,
+                    }],
+                },
+                WireMessage::ImageStart {
+                    id: id.clone(),
+                    version,
+                    fingerprint: 0,
+                    width: 1,
+                    height: 1,
+                    size: 4,
+                },
+                WireMessage::Clipboard {
+                    id,
+                    version,
+                    text: "invalid message must not reach the clipboard".into(),
+                },
+            ] {
+                handle_incoming_event(
+                    IncomingEvent::Message {
+                        peer_id: 1,
+                        message,
+                    },
+                    &mut clipboard,
+                    &mut state,
+                    &hub,
+                )
+                .unwrap();
+                assert_eq!(state.version, initial_version);
+                assert_eq!(state.applied_version, Some(initial_version));
+                assert_eq!(state.last_fingerprint, Some(42));
+                assert!(state.active_transfers.is_empty());
+                assert!(state.active_images.is_empty());
+                assert!(state.receipts.statuses.is_empty());
+                assert!(state.receipts.order.is_empty());
+            }
         }
     }
 
