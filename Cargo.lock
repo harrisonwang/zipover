@@ -1897,7 +1897,7 @@ checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[package]]
 name = "zipover-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "zipover-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "arboard",
