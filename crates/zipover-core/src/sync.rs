@@ -77,6 +77,7 @@ struct SendRetry {
 struct OutgoingSend<'scope> {
     version: ClipboardVersion,
     id: String,
+    file_transfer: bool,
     cancelled: Arc<AtomicBool>,
     receipt: SyncSender<DeliveryStatus>,
     job: thread::ScopedJoinHandle<'scope, Result<()>>,
@@ -347,6 +348,10 @@ pub(crate) fn clipboard_loop(
                                         OutgoingSend {
                                             version,
                                             id,
+                                            file_transfer: matches!(
+                                                payload.as_ref(),
+                                                CapturedPayload::Files(_)
+                                            ),
                                             cancelled,
                                             receipt,
                                             job: scope.spawn(move || {
@@ -393,20 +398,31 @@ pub(crate) fn clipboard_loop(
                     send.cancelled.store(true, Ordering::Release);
                 }
             }
-            status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .sync_error = state
-                .last_receive_error
-                .as_ref()
-                .or(state.last_send_error.as_ref())
-                .or(state.last_capture_error.as_ref())
-                .cloned();
+            {
+                let mut status = status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                status.sending_files = outgoing.values().any(|send| {
+                    send.file_transfer
+                        && send.version == state.version
+                        && !send.cancelled.load(Ordering::Acquire)
+                });
+                status.sync_error = state
+                    .last_receive_error
+                    .as_ref()
+                    .or(state.last_send_error.as_ref())
+                    .or(state.last_capture_error.as_ref())
+                    .cloned();
+            }
             thread::sleep(POLL_INTERVAL);
         };
         for send in outgoing.values() {
             send.cancelled.store(true, Ordering::Release);
         }
+        status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sending_files = false;
         hub.shutdown();
         result
     })

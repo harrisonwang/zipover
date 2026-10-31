@@ -50,12 +50,14 @@ pub struct Snapshot {
     pub error: Option<String>,
     pub discovery_error: Option<String>,
     pub sync_error: Option<String>,
+    pub sending_files: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct RuntimeStatus {
     pub discovery_error: Option<String>,
     pub sync_error: Option<String>,
+    pub sending_files: bool,
 }
 
 pub(crate) type SharedStatus = Arc<Mutex<RuntimeStatus>>;
@@ -174,6 +176,7 @@ impl SyncRuntime {
             error: pairing.error.clone(),
             discovery_error: status.discovery_error.clone(),
             sync_error: status.sync_error.clone(),
+            sending_files: status.sending_files,
         }
     }
 
