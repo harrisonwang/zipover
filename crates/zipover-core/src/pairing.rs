@@ -58,14 +58,19 @@ pub(crate) type SharedPairing = Arc<Mutex<Pairing>>;
 
 impl Pairing {
     pub fn new(store: ConfigStore) -> SharedPairing {
-        Arc::new(Mutex::new(Self {
+        let mut pairing = Self {
             store,
             discovered: Vec::new(),
             invitation: None,
             request: None,
             result: None,
             error: None,
-        }))
+        };
+        // 首次启动直接进入待配对状态，另一台设备打开后即可发现本机。
+        if pairing.store.config.peers.is_empty() && pairing.start_invitation().is_err() {
+            pairing.error = Some(crate::i18n::tr("pairing.generate_code_failed").into());
+        }
+        Arc::new(Mutex::new(pairing))
     }
 
     pub fn invite(&mut self) -> Result<String> {

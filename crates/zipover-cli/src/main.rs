@@ -134,7 +134,6 @@ fn sync(options: SyncOptions, code: Option<String>, device: Option<String>) -> R
         localized!(eprintln, "pairing.started");
         wait_for_pairing(&runtime)?;
     } else if runtime.snapshot().devices.is_empty() {
-        runtime.generate_code()?;
         wait_for_pairing(&runtime)?;
     }
     localized!(eprintln, "sync.started");
