@@ -14,7 +14,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail};
 use arboard::Clipboard;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     hash::{Hash, Hasher},
     sync::{
         Arc,
@@ -69,9 +69,15 @@ struct ActiveImage {
     size: u64,
 }
 
-struct SendRetry {
-    delay: Duration,
-    after: Instant,
+/// 当前剪贴板版本对单个对端的投递进度；不在表中表示仍待投递。
+/// 版本变化时整表清空，所有对端回到待投递。
+enum PeerDelivery {
+    Delivered,
+    /// 发送失败后按指数退避等待，到期后重新成为投递目标。
+    Retrying {
+        delay: Duration,
+        after: Instant,
+    },
 }
 
 struct OutgoingSend<'scope> {
@@ -87,11 +93,10 @@ struct SyncState {
     origin: String,
     sequence: u64,
     last_fingerprint: Option<u64>,
-    sent_peers: HashSet<u64>,
     local_id: crate::config::DeviceId,
     version: ClipboardVersion,
     applied_version: Option<ClipboardVersion>,
-    send_retries: HashMap<u64, SendRetry>,
+    deliveries: HashMap<u64, PeerDelivery>,
     last_capture_error: Option<String>,
     last_receive_error: Option<String>,
     last_send_error: Option<String>,
@@ -106,11 +111,10 @@ impl SyncState {
             origin: format!("{}-{}", std::process::id(), timestamp_nanos()),
             sequence: 0,
             last_fingerprint: None,
-            sent_peers: HashSet::new(),
             local_id,
             version: ClipboardVersion::default(),
             applied_version: None,
-            send_retries: HashMap::new(),
+            deliveries: HashMap::new(),
             last_capture_error: None,
             last_receive_error: None,
             last_send_error: None,
@@ -149,11 +153,15 @@ impl SyncState {
                 origin: self.local_id,
             };
             self.applied_version = Some(self.version);
-            self.sent_peers.clear();
-            self.send_retries.clear();
-            self.last_send_error = None;
+            self.reset_deliveries();
             self.last_receive_error = None;
         }
+    }
+
+    /// 剪贴板版本变化后，旧版本的投递进度与发送错误全部失效。
+    fn reset_deliveries(&mut self) {
+        self.deliveries.clear();
+        self.last_send_error = None;
     }
 
     /// 自写缓存不算本地复制；返回值表示该载荷是否可作为本地内容发送。
@@ -169,12 +177,10 @@ impl SyncState {
         peers
             .iter()
             .copied()
-            .filter(|peer_id| {
-                !self.sent_peers.contains(peer_id)
-                    && self
-                        .send_retries
-                        .get(peer_id)
-                        .is_none_or(|retry| retry.after <= now)
+            .filter(|peer_id| match self.deliveries.get(peer_id) {
+                None => true,
+                Some(PeerDelivery::Delivered) => false,
+                Some(PeerDelivery::Retrying { after, .. }) => *after <= now,
             })
             .collect()
     }
@@ -194,24 +200,27 @@ impl SyncState {
         match result {
             Ok(()) => {
                 for peer_id in targets.iter().filter(|id| connected.contains(id)) {
-                    self.sent_peers.insert(*peer_id);
-                    self.send_retries.remove(peer_id);
+                    self.deliveries.insert(*peer_id, PeerDelivery::Delivered);
                 }
-                if self.send_retries.is_empty() {
+                if !self
+                    .deliveries
+                    .values()
+                    .any(|delivery| matches!(delivery, PeerDelivery::Retrying { .. }))
+                {
                     self.last_send_error = None;
                 }
             }
             Err(error) => {
                 for peer_id in targets.iter().filter(|id| connected.contains(id)) {
-                    let delay = self
-                        .send_retries
-                        .get(peer_id)
-                        .map_or(INITIAL_SEND_RETRY_DELAY, |retry| {
-                            retry.delay.saturating_mul(2).min(MAX_SEND_RETRY_DELAY)
-                        });
-                    self.send_retries.insert(
+                    let delay = match self.deliveries.get(peer_id) {
+                        Some(PeerDelivery::Retrying { delay, .. }) => {
+                            delay.saturating_mul(2).min(MAX_SEND_RETRY_DELAY)
+                        }
+                        _ => INITIAL_SEND_RETRY_DELAY,
+                    };
+                    self.deliveries.insert(
                         *peer_id,
-                        SendRetry {
+                        PeerDelivery::Retrying {
                             delay,
                             after: now + delay,
                         },
@@ -374,7 +383,9 @@ pub(crate) fn clipboard_loop(
                                 }
                             }
                         } else {
-                            state.sent_peers.extend(&peers);
+                            state
+                                .deliveries
+                                .extend(peers.iter().map(|&peer| (peer, PeerDelivery::Delivered)));
                         }
                     }
                     Ok(None) => {
@@ -538,9 +549,7 @@ fn accept_version(
     }
     if version > state.version {
         state.version = version;
-        state.sent_peers.clear();
-        state.send_retries.clear();
-        state.last_send_error = None;
+        state.reset_deliveries();
         discard_obsolete_transfers(state, hub);
     }
     true
@@ -590,8 +599,7 @@ fn handle_incoming_event(
     let (peer_id, message) = match event {
         IncomingEvent::Message { peer_id, message } => (peer_id, message),
         IncomingEvent::Disconnected { peer_id } => {
-            state.sent_peers.remove(&peer_id);
-            state.send_retries.remove(&peer_id);
+            state.deliveries.remove(&peer_id);
             cleanup_peer_sessions(state, peer_id);
             return Ok(());
         }
@@ -828,8 +836,11 @@ fn mark_remote_applied(
     state.last_receive_error = None;
     state.last_capture_error = None;
     state.applied_version = Some(version);
-    state.send_retries.clear();
-    state.sent_peers.insert(peer_id);
+    // 来源对端已持有该版本；其他已确认的对端保留，退避中的对端立即恢复为待投递。
+    state
+        .deliveries
+        .retain(|_, delivery| matches!(delivery, PeerDelivery::Delivered));
+    state.deliveries.insert(peer_id, PeerDelivery::Delivered);
     state.last_send_error = None;
 }
 
@@ -978,7 +989,23 @@ impl RecentDeliveries {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
-    use std::{env, fs, path::PathBuf};
+    use std::{collections::HashSet, env, fs, path::PathBuf};
+
+    fn delivered(state: &SyncState) -> HashSet<u64> {
+        state
+            .deliveries
+            .iter()
+            .filter(|(_, delivery)| matches!(delivery, PeerDelivery::Delivered))
+            .map(|(peer, _)| *peer)
+            .collect()
+    }
+
+    fn retrying(state: &SyncState) -> bool {
+        state
+            .deliveries
+            .values()
+            .any(|delivery| matches!(delivery, PeerDelivery::Retrying { .. }))
+    }
 
     #[test]
     fn relative_path_rejects_traversal() {
@@ -1188,15 +1215,17 @@ mod tests {
     fn remote_clipboard_resets_delivery_tracking() {
         let mut state = SyncState::new([1; 16]);
         state.observe_fingerprint(1);
-        state.sent_peers.extend([2, 3]);
+        state
+            .deliveries
+            .extend([2, 3].map(|peer| (peer, PeerDelivery::Delivered)));
 
         state.observe_fingerprint(2);
         let remote_version = state.version;
         mark_remote_applied(&mut state, 2, 4, remote_version);
-        assert_eq!(state.sent_peers, HashSet::from([4]));
+        assert_eq!(delivered(&state), HashSet::from([4]));
 
         mark_remote_applied(&mut state, 2, 5, remote_version);
-        assert_eq!(state.sent_peers, HashSet::from([4, 5]));
+        assert_eq!(delivered(&state), HashSet::from([4, 5]));
     }
 
     #[test]
@@ -1220,7 +1249,7 @@ mod tests {
         assert_eq!(state.delivery_targets(&[2, 3], retry_at), vec![3]);
         state.complete_send(version, &[3], &[2, 3], Ok(()), retry_at);
         assert!(state.delivery_targets(&[2, 3], retry_at).is_empty());
-        assert!(state.send_retries.is_empty());
+        assert!(!retrying(&state));
     }
 
     #[test]
@@ -1234,7 +1263,7 @@ mod tests {
         let result = wait_for_delivery(Ok(()), &receiver, &cancelled);
         assert!(result.is_err());
         state.complete_send(state.version, &[2], &[2], result, now);
-        assert!(state.sent_peers.is_empty());
+        assert!(delivered(&state).is_empty());
         assert_eq!(
             state.delivery_targets(&[2], now + INITIAL_SEND_RETRY_DELAY),
             [2]
@@ -1250,8 +1279,8 @@ mod tests {
             now + INITIAL_SEND_RETRY_DELAY,
         );
         assert_eq!(state.last_fingerprint, Some(42));
-        assert_eq!(state.sent_peers, HashSet::from([2]));
-        assert!(state.send_retries.is_empty());
+        assert_eq!(delivered(&state), HashSet::from([2]));
+        assert!(!retrying(&state));
     }
 
     #[test]
@@ -1352,8 +1381,8 @@ mod tests {
             mark_remote_applied(&mut state, 2, 4, remote_version);
             state.complete_send(version, &[2, 3], &[2, 3, 4], result, Instant::now());
             assert_eq!(state.last_fingerprint, Some(2));
-            assert_eq!(state.sent_peers, HashSet::from([4]));
-            assert!(state.send_retries.is_empty());
+            assert_eq!(delivered(&state), HashSet::from([4]));
+            assert!(!retrying(&state));
             assert!(state.last_send_error.is_none());
         }
     }
@@ -1363,7 +1392,7 @@ mod tests {
         let mut state = SyncState::new([1; 16]);
         state.observe_fingerprint(1);
         state.complete_send(state.version, &[2, 3], &[3], Ok(()), Instant::now());
-        assert_eq!(state.sent_peers, HashSet::from([3]));
+        assert_eq!(delivered(&state), HashSet::from([3]));
     }
 
     #[test]
