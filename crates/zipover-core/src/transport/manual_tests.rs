@@ -211,7 +211,7 @@ fn wrong_manual_code_and_cancelled_request_do_not_save_targets() {
     let code = b.pairing.lock().unwrap().invite().unwrap();
     let wrong = if code == "000000" { "000001" } else { "000000" };
     a.pairing.lock().unwrap().join_at(wrong, b.address).unwrap();
-    wait(|| a.pairing.lock().unwrap().error.is_some());
+    wait(|| a.pairing.lock().unwrap().error().is_some());
     assert!(a.pairing.lock().unwrap().store.config.peers.is_empty());
     assert!(b.pairing.lock().unwrap().store.config.peers.is_empty());
     {

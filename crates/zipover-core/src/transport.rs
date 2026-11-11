@@ -315,9 +315,8 @@ pub(crate) fn network_loop(
                     ));
                 }
             }
-            let state = &mut *pairing;
-            if let Some(request) = state.request.as_mut().filter(|r| !r.started) {
-                let mut candidates: Vec<_> = state
+            if let Some(request) = pairing.pending_request() {
+                let mut candidates: Vec<_> = pairing
                     .discovered
                     .iter()
                     .filter(|p| {
@@ -343,27 +342,25 @@ pub(crate) fn network_loop(
                     None
                 };
                 if let Some((id, addresses)) = target {
-                    if jobs.len() < MAX_PEERS && !jobs.iter().any(|(pending, _)| *pending == id) {
-                        request.started = true;
+                    if jobs.len() < MAX_PEERS
+                        && !jobs.iter().any(|(pending, _)| *pending == id)
+                        && let Some(attempt) = pairing.begin_outgoing()
+                    {
                         targets.retain(|(other, ..)| *other != id);
-                        targets.insert(
-                            0,
-                            (id, ConnectionAuth::Pair(request.attempt.clone()), addresses),
-                        );
+                        targets.insert(0, (id, ConnectionAuth::Pair(attempt), addresses));
                     }
                 } else if candidates.len() > 1 {
-                    state.request = None;
-                    state.error =
-                        Some(crate::i18n::tr("transport.multiple_pairing_devices").into());
+                    pairing.fail_discovery(
+                        crate::i18n::tr("transport.multiple_pairing_devices").into(),
+                    );
                 } else if already_connected {
-                    state.request = None;
-                    state.error = Some(crate::i18n::tr("transport.already_connected").into());
+                    pairing.fail_discovery(crate::i18n::tr("transport.already_connected").into());
                 }
-            } else if state.request.is_none()
+            } else if pairing.join_progress().is_none()
                 && let Some(address) = &options.connect
-                && state.store.config.peers.len() == 1
+                && pairing.store.config.peers.len() == 1
             {
-                let peer = &state.store.config.peers[0];
+                let peer = &pairing.store.config.peers[0];
                 targets.retain(|(other, ..)| *other != peer.id);
                 targets.push((
                     peer.id,
@@ -625,12 +622,7 @@ fn establish(
             let mut pairing = shared.lock().unwrap_or_else(|error| {
                 panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
             });
-            pairing.result = Some(crate::i18n::localized!(
-                format,
-                "transport.paired",
-                remote_name = remote_name
-            ));
-            pairing.error = None;
+            pairing.complete(attempt, role)?;
             crate::i18n::localized!(
                 eprintln,
                 "transport.paired_automatic",
@@ -867,7 +859,7 @@ mod tests {
         known_target: bool,
     ) -> (bool, bool) {
         a.lock().unwrap().join(code, None).unwrap();
-        let attempt = a.lock().unwrap().request.as_ref().unwrap().attempt.clone();
+        let attempt = a.lock().unwrap().begin_outgoing().unwrap();
         let target_id = if known_target {
             b.lock().unwrap().store.config.id
         } else {
@@ -915,6 +907,68 @@ mod tests {
         assert_eq!(a.lock().unwrap().store.config.peers[0].key, key);
         drop((a, b));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saved_pairing_handles_missing_and_superseded_tcp_confirmation() {
+        for replace_invitation in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "zipover-confirmation-{}",
+                hex::encode(random_bytes::<16>().unwrap())
+            ));
+            let pairing = Pairing::new(ConfigStore::open(root.join("devices.json")).unwrap());
+            let code = pairing.lock().unwrap().invite().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_pairing = pairing.clone();
+            let server = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let (tx, _rx) = mpsc::sync_channel(1);
+                establish(stream, None, &PeerHub::default(), &server_pairing, &tx).is_ok()
+            });
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream.set_read_timeout(Some(PEER_CONNECT_TIMEOUT)).unwrap();
+            stream.set_write_timeout(Some(PEER_SEND_TIMEOUT)).unwrap();
+            let mut preface = [0; PREFACE_LEN];
+            preface[..5].copy_from_slice(MAGIC);
+            preface[5..21].copy_from_slice(&[9; 16]);
+            preface[37] = 2;
+            stream.write_all(&preface).unwrap();
+            let mut responder = [0; 16];
+            stream.read_exact(&mut responder).unwrap();
+            let mut context = preface.to_vec();
+            context.extend_from_slice(&responder);
+            let key = crypto::pairing_key(&mut stream, ConnectionRole::Initiator, &code, &context)
+                .unwrap();
+            let (mut writer, mut reader) =
+                crypto::handshake(&mut stream, ConnectionRole::Initiator, &key, &context).unwrap();
+            writer
+                .write_frame(&mut stream, b"confirmation peer")
+                .unwrap();
+            reader.read_frame(&mut stream).unwrap();
+            assert_eq!(reader.read_frame(&mut stream).unwrap(), b"paired");
+            assert_eq!(pairing.lock().unwrap().key_for([9; 16]).unwrap(), key);
+
+            // 服务端已保存信任，但还未收到客户端的最终确认。
+            let new_code = if replace_invitation {
+                let code = pairing.lock().unwrap().invite().unwrap();
+                writer.write_frame(&mut stream, b"paired").unwrap();
+                Some(code)
+            } else {
+                None
+            };
+            drop(stream);
+            assert!(!server.join().unwrap());
+            {
+                let pairing = pairing.lock().unwrap();
+                assert!(!pairing.is_paired());
+                assert_eq!(pairing.invitation_code(), new_code.as_deref());
+                assert_eq!(pairing.error().is_some(), !replace_invitation);
+                assert_eq!(pairing.key_for([9; 16]).unwrap(), key);
+            }
+            drop(pairing);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

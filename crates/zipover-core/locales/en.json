@@ -170,7 +170,6 @@
   "transport.invalid_name_encoding": "The device name is not valid UTF-8",
   "transport.invalid_name": "Invalid device name",
   "transport.pairing_not_saved": "The remote device did not save the pairing",
-  "transport.paired": "Paired with %{remote_name}",
   "transport.paired_automatic": "Clipboard sync: paired with %{remote_name}; future connections are automatic",
   "transport.unpaired": "The device is no longer paired",
   "transport.connected": "Clipboard sync: encrypted connection to %{name} (%{device})",

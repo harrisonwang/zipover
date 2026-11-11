@@ -170,7 +170,6 @@
   "transport.invalid_name_encoding": "设备名不是 UTF-8",
   "transport.invalid_name": "设备名无效",
   "transport.pairing_not_saved": "对端未保存配对",
-  "transport.paired": "已配对：%{remote_name}",
   "transport.paired_automatic": "剪贴板同步：已配对 %{remote_name}，以后自动连接",
   "transport.unpaired": "设备已解除配对",
   "transport.connected": "剪贴板同步：已加密连接 %{name}（%{device}）",

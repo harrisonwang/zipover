@@ -28,6 +28,8 @@ pub(crate) struct DiscoveredPeer {
 #[derive(Clone)]
 pub(crate) struct PairAttempt {
     generation: DeviceId,
+    // 同一邀请码可有多个并发握手；序号区分实际提交信任的那一次连接。
+    connection: u8,
     pub code: String,
     expires: Instant,
 }
@@ -38,20 +40,29 @@ struct Invitation {
 }
 
 pub(crate) struct PairRequest {
-    pub attempt: PairAttempt,
+    attempt: PairAttempt,
     pub device: Option<String>,
     pub endpoint: Option<SocketAddr>,
-    pub started: bool,
+    started: bool,
     discovery_deadline: Instant,
+}
+
+enum PairingState {
+    Idle,
+    Inviting(Invitation),
+    Joining(PairRequest),
+    Confirming {
+        attempt: PairAttempt,
+        role: ConnectionRole,
+    },
+    Paired,
+    Failed(String),
 }
 
 pub(crate) struct Pairing {
     pub store: ConfigStore,
     pub discovered: Vec<DiscoveredPeer>,
-    invitation: Option<Invitation>,
-    pub(crate) request: Option<PairRequest>,
-    pub result: Option<String>,
-    pub error: Option<String>,
+    state: PairingState,
 }
 
 pub(crate) type SharedPairing = Arc<Mutex<Pairing>>;
@@ -61,14 +72,11 @@ impl Pairing {
         let mut pairing = Self {
             store,
             discovered: Vec::new(),
-            invitation: None,
-            request: None,
-            result: None,
-            error: None,
+            state: PairingState::Idle,
         };
         // 首次启动直接进入待配对状态，另一台设备打开后即可发现本机。
-        if pairing.store.config.peers.is_empty() && pairing.start_invitation().is_err() {
-            pairing.error = Some(crate::i18n::tr("pairing.generate_code_failed").into());
+        if pairing.store.config.peers.is_empty() {
+            pairing.renew_invitation();
         }
         Arc::new(Mutex::new(pairing))
     }
@@ -89,46 +97,98 @@ impl Pairing {
         let code = format!("{number:06}");
         let attempt = PairAttempt {
             generation: random_bytes()?,
+            connection: 0,
             code: code.clone(),
             expires: Instant::now() + PAIRING_LIFETIME,
         };
-        self.invitation = Some(Invitation {
+        self.state = PairingState::Inviting(Invitation {
             attempt,
             attempts: 0,
         });
-        self.error = None;
         Ok(code)
+    }
+
+    fn renew_invitation(&mut self) {
+        if self.start_invitation().is_err() {
+            self.state =
+                PairingState::Failed(crate::i18n::tr("pairing.generate_code_failed").into());
+        }
     }
 
     pub fn is_inviting(&self) -> bool {
         // 更新配对码时不能短暂撤销设备发现广播。
-        self.invitation.is_some()
+        matches!(self.state, PairingState::Inviting(_))
     }
 
     pub fn invitation_code(&self) -> Option<&str> {
-        self.invitation
-            .as_ref()
-            .filter(|i| i.attempt.expires > Instant::now())
-            .map(|i| i.attempt.code.as_str())
+        match &self.state {
+            PairingState::Inviting(invitation) if invitation.attempt.expires > Instant::now() => {
+                Some(&invitation.attempt.code)
+            }
+            _ => None,
+        }
     }
 
     pub fn seconds_left(&self) -> u64 {
-        self.invitation.as_ref().map_or(0, |i| {
-            i.attempt
+        match &self.state {
+            PairingState::Inviting(invitation) => invitation
+                .attempt
                 .expires
                 .saturating_duration_since(Instant::now())
-                .as_secs()
-        })
+                .as_secs(),
+            _ => 0,
+        }
     }
 
     pub fn join_progress(&self) -> Option<JoinProgress> {
-        self.request.as_ref().map(|request| {
-            if request.started || request.endpoint.is_some() {
-                JoinProgress::Connecting
-            } else {
-                JoinProgress::Discovering
+        match &self.state {
+            PairingState::Joining(request) => {
+                Some(if request.started || request.endpoint.is_some() {
+                    JoinProgress::Connecting
+                } else {
+                    JoinProgress::Discovering
+                })
             }
-        })
+            PairingState::Confirming {
+                role: ConnectionRole::Initiator,
+                ..
+            } => Some(JoinProgress::Connecting),
+            _ => None,
+        }
+    }
+
+    pub fn is_paired(&self) -> bool {
+        matches!(self.state, PairingState::Paired)
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        match &self.state {
+            PairingState::Failed(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn pending_request(&self) -> Option<&PairRequest> {
+        match &self.state {
+            PairingState::Joining(request) if !request.started => Some(request),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn begin_outgoing(&mut self) -> Option<PairAttempt> {
+        match &mut self.state {
+            PairingState::Joining(request) if !request.started => {
+                request.started = true;
+                Some(request.attempt.clone())
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn fail_discovery(&mut self, error: String) {
+        if self.pending_request().is_some() {
+            self.state = PairingState::Failed(error);
+        }
     }
 
     pub fn join(&mut self, code: &str, device: Option<String>) -> Result<()> {
@@ -149,11 +209,11 @@ impl Pairing {
         let code = parse_code(code)?;
         let attempt = PairAttempt {
             generation: random_bytes()?,
+            connection: 0,
             code,
             expires: Instant::now() + PAIRING_LIFETIME,
         };
-        self.cancel();
-        self.request = Some(PairRequest {
+        self.state = PairingState::Joining(PairRequest {
             attempt,
             device,
             endpoint,
@@ -164,10 +224,7 @@ impl Pairing {
     }
 
     pub fn cancel(&mut self) {
-        self.invitation = None;
-        self.request = None;
-        self.result = None;
-        self.error = None;
+        self.state = PairingState::Idle;
     }
 
     pub fn key_for(&self, id: DeviceId) -> Result<PairingKey> {
@@ -182,15 +239,16 @@ impl Pairing {
 
     pub(crate) fn begin_incoming(&mut self) -> Result<PairAttempt> {
         self.expire();
-        let invitation = self
-            .invitation
-            .as_mut()
-            .context(crate::i18n::tr("pairing.invitation_expired"))?;
+        let PairingState::Inviting(invitation) = &mut self.state else {
+            crate::i18n::localized!(bail, "pairing.invitation_expired");
+        };
         if invitation.attempts >= MAX_ATTEMPTS {
             crate::i18n::localized!(bail, "pairing.too_many_attempts")
         }
         invitation.attempts += 1;
-        Ok(invitation.attempt.clone())
+        let mut attempt = invitation.attempt.clone();
+        attempt.connection = invitation.attempts;
+        Ok(attempt)
     }
 
     // 仅在 SPAKE2 和加密握手确认配对码后调用。
@@ -200,9 +258,12 @@ impl Pairing {
         attempt: &PairAttempt,
         role: ConnectionRole,
     ) -> Result<()> {
-        let current = match role {
-            ConnectionRole::Initiator => self.request.as_ref().map(|r| &r.attempt),
-            ConnectionRole::Responder => self.invitation.as_ref().map(|i| &i.attempt),
+        let current = match (&self.state, role) {
+            (PairingState::Joining(request), ConnectionRole::Initiator) => Some(&request.attempt),
+            (PairingState::Inviting(invitation), ConnectionRole::Responder) => {
+                Some(&invitation.attempt)
+            }
+            _ => None,
         };
         if !current
             .is_some_and(|a| a.generation == attempt.generation && a.expires > Instant::now())
@@ -210,75 +271,83 @@ impl Pairing {
             crate::i18n::localized!(bail, "pairing.attempt_expired")
         }
         self.store.trust(peer)?;
-        match role {
-            ConnectionRole::Initiator => self.request = None,
-            ConnectionRole::Responder => self.invitation = None,
+        // 信任已落盘但双方尚未确认；保留尝试身份，防止迟到结果覆盖新操作。
+        self.state = PairingState::Confirming {
+            attempt: attempt.clone(),
+            role,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn complete(&mut self, attempt: &PairAttempt, role: ConnectionRole) -> Result<()> {
+        if !matches!(&self.state, PairingState::Confirming { attempt: current, role: current_role }
+            if *current_role == role
+                && current.generation == attempt.generation
+                && current.connection == attempt.connection
+                && current.expires > Instant::now())
+        {
+            crate::i18n::localized!(bail, "pairing.attempt_expired");
         }
+        self.state = PairingState::Paired;
         Ok(())
     }
 
     pub(crate) fn failed(&mut self, attempt: &PairAttempt, role: ConnectionRole) {
-        if role == ConnectionRole::Initiator {
-            if self
-                .request
-                .as_ref()
-                .is_some_and(|r| r.attempt.generation == attempt.generation)
+        match &self.state {
+            PairingState::Joining(request)
+                if role == ConnectionRole::Initiator
+                    && request.attempt.generation == attempt.generation =>
             {
-                self.request = None;
-                self.error = Some(crate::i18n::tr("pairing.connection_failed").into());
+                self.state =
+                    PairingState::Failed(crate::i18n::tr("pairing.connection_failed").into());
             }
-        } else if self.invitation.as_ref().is_some_and(|i| {
-            i.attempt.generation == attempt.generation && i.attempts >= MAX_ATTEMPTS
-        }) {
-            // 猜测次数耗尽后仍保持邀请模式可用，并在此轮换配对码，
-            // 使界面无需为可恢复的配对失败提供手动重新生成功能。
-            if self.start_invitation().is_err() {
-                self.invitation = None;
-                self.error = Some(crate::i18n::tr("pairing.generate_code_failed").into());
+            PairingState::Confirming {
+                attempt: current,
+                role: current_role,
+            } if *current_role == role
+                && current.generation == attempt.generation
+                && current.connection == attempt.connection =>
+            {
+                self.state =
+                    PairingState::Failed(crate::i18n::tr("pairing.connection_failed").into());
             }
+            PairingState::Inviting(invitation)
+                if role == ConnectionRole::Responder
+                    && invitation.attempt.generation == attempt.generation
+                    && invitation.attempts >= MAX_ATTEMPTS =>
+            {
+                self.renew_invitation();
+            }
+            _ => {}
         }
     }
 
     pub fn expire(&mut self) {
         let now = Instant::now();
-        if self
-            .invitation
-            .as_ref()
-            .is_some_and(|i| i.attempt.expires <= now)
-        {
-            // 保持邀请模式开启，并直接轮换短期配对码。设备发现广播持续可用，
-            // 其他设备无需等待重新打开面板即可继续配对。
-            if self.start_invitation().is_err() {
-                self.invitation = None;
-                self.error = Some(crate::i18n::tr("pairing.generate_code_failed").into());
+        match &self.state {
+            PairingState::Inviting(invitation) if invitation.attempt.expires <= now => {
+                // 轮换短期配对码时持续保留邀请广播。
+                self.renew_invitation();
             }
-        } else if self
-            .request
-            .as_ref()
-            .is_some_and(|r| !r.started && r.discovery_deadline <= now)
-        {
-            let manual = self
-                .request
-                .as_ref()
-                .is_some_and(|request| request.endpoint.is_some());
-            self.request = None;
-            self.error = Some(
-                if manual {
-                    crate::i18n::tr("pairing.manual_connection_failed")
-                } else {
-                    crate::i18n::tr("pairing.device_not_found")
-                }
-                .into(),
-            );
-        } else if self
-            .request
-            .as_ref()
-            .is_some_and(|r| r.attempt.expires <= now)
-        {
-            // 加入配对的设备没有新配对码可显示，应返回输入状态，
-            // 让用户输入邀请设备当前显示的配对码。
-            self.request = None;
-            self.error = Some(crate::i18n::tr("pairing.code_expired").into());
+            PairingState::Joining(request)
+                if !request.started && request.discovery_deadline <= now =>
+            {
+                self.state = PairingState::Failed(
+                    if request.endpoint.is_some() {
+                        crate::i18n::tr("pairing.manual_connection_failed")
+                    } else {
+                        crate::i18n::tr("pairing.device_not_found")
+                    }
+                    .into(),
+                );
+            }
+            PairingState::Joining(PairRequest { attempt, .. })
+            | PairingState::Confirming { attempt, .. }
+                if attempt.expires <= now =>
+            {
+                self.state = PairingState::Failed(crate::i18n::tr("pairing.code_expired").into());
+            }
+            _ => {}
         }
     }
 }
@@ -314,6 +383,161 @@ mod tests {
             addresses: Vec::new(),
             name: "test".into(),
         }
+    }
+
+    fn start_attempt(pairing: &mut Pairing, role: ConnectionRole) -> PairAttempt {
+        match role {
+            ConnectionRole::Initiator => {
+                pairing.join("123456", None).unwrap();
+                pairing.begin_outgoing().unwrap()
+            }
+            ConnectionRole::Responder => {
+                pairing.invite().unwrap();
+                pairing.begin_incoming().unwrap()
+            }
+        }
+    }
+
+    #[test]
+    fn saved_pairing_completes_only_after_confirmation_of_the_current_attempt() {
+        for role in [ConnectionRole::Initiator, ConnectionRole::Responder] {
+            let shared = pairing();
+            let mut pairing = shared.lock().unwrap();
+            let attempt = start_attempt(&mut pairing, role);
+            assert!(pairing.complete(&attempt, role).is_err());
+            pairing.accept(peer(), &attempt, role).unwrap();
+            assert!(!pairing.is_paired());
+            assert!(pairing.invitation_code().is_none());
+            assert!(pairing.begin_incoming().is_err());
+            assert!(pairing.accept(peer(), &attempt, role).is_err());
+            assert_eq!(
+                pairing.join_progress(),
+                (role == ConnectionRole::Initiator).then_some(JoinProgress::Connecting)
+            );
+            let other_role = match role {
+                ConnectionRole::Initiator => ConnectionRole::Responder,
+                ConnectionRole::Responder => ConnectionRole::Initiator,
+            };
+            pairing.failed(&attempt, other_role);
+            assert!(pairing.complete(&attempt, other_role).is_err());
+            assert!(pairing.error().is_none());
+            pairing.complete(&attempt, role).unwrap();
+            assert!(pairing.is_paired());
+            assert!(pairing.join_progress().is_none());
+            assert!(pairing.complete(&attempt, role).is_err());
+            pairing.failed(&attempt, role);
+            assert!(pairing.is_paired());
+            assert!(pairing.error().is_none());
+            assert_eq!(pairing.key_for(peer().id).unwrap(), peer().key);
+        }
+    }
+
+    #[test]
+    fn late_confirmation_and_failure_cannot_overwrite_cancel_or_replacement() {
+        let replacements: [fn(&mut Pairing); 3] = [
+            Pairing::cancel,
+            |pairing| {
+                pairing.invite().unwrap();
+            },
+            |pairing| {
+                pairing.join("654321", None).unwrap();
+            },
+        ];
+        for role in [ConnectionRole::Initiator, ConnectionRole::Responder] {
+            for replace in replacements {
+                let shared = pairing();
+                let mut pairing = shared.lock().unwrap();
+                let attempt = start_attempt(&mut pairing, role);
+                pairing.accept(peer(), &attempt, role).unwrap();
+                replace(&mut pairing);
+                let code = pairing.invitation_code().map(str::to_owned);
+                let generation = pairing
+                    .pending_request()
+                    .map(|request| request.attempt.generation);
+                let progress = pairing.join_progress();
+
+                assert!(pairing.complete(&attempt, role).is_err());
+                pairing.failed(&attempt, role);
+
+                assert_eq!(pairing.invitation_code(), code.as_deref());
+                assert_eq!(
+                    pairing
+                        .pending_request()
+                        .map(|request| request.attempt.generation),
+                    generation
+                );
+                assert_eq!(pairing.join_progress(), progress);
+                assert!(!pairing.is_paired());
+                assert!(pairing.error().is_none());
+                assert_eq!(pairing.key_for(peer().id).unwrap(), peer().key);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_or_expired_confirmation_leaves_a_visible_error() {
+        for role in [ConnectionRole::Initiator, ConnectionRole::Responder] {
+            for expired in [false, true] {
+                let shared = pairing();
+                let mut pairing = shared.lock().unwrap();
+                let attempt = start_attempt(&mut pairing, role);
+                pairing.accept(peer(), &attempt, role).unwrap();
+                let error = if expired {
+                    let PairingState::Confirming {
+                        attempt: current, ..
+                    } = &mut pairing.state
+                    else {
+                        panic!()
+                    };
+                    current.expires = Instant::now();
+                    assert!(pairing.complete(&attempt, role).is_err());
+                    pairing.expire();
+                    crate::i18n::tr("pairing.code_expired")
+                } else {
+                    pairing.failed(&attempt, role);
+                    crate::i18n::tr("pairing.connection_failed")
+                };
+                assert_eq!(pairing.error(), Some(error.as_ref()));
+                assert!(!pairing.is_paired());
+                assert!(!pairing.is_inviting());
+                assert!(pairing.join_progress().is_none());
+                assert!(pairing.complete(&attempt, role).is_err());
+                assert_eq!(pairing.key_for(peer().id).unwrap(), peer().key);
+            }
+        }
+    }
+
+    #[test]
+    fn other_handshakes_for_the_same_code_cannot_finish_the_accepted_connection() {
+        let shared = pairing();
+        let mut pairing = shared.lock().unwrap();
+        pairing.invite().unwrap();
+        let attempts: Vec<_> = (0..MAX_ATTEMPTS)
+            .map(|_| pairing.begin_incoming().unwrap())
+            .collect();
+        let accepted = &attempts[0];
+        pairing
+            .accept(peer(), accepted, ConnectionRole::Responder)
+            .unwrap();
+        for attempt in &attempts[1..] {
+            assert!(
+                pairing
+                    .accept(peer(), attempt, ConnectionRole::Responder)
+                    .is_err()
+            );
+            pairing.failed(attempt, ConnectionRole::Responder);
+            assert!(
+                pairing
+                    .complete(attempt, ConnectionRole::Responder)
+                    .is_err()
+            );
+            assert!(!pairing.is_paired());
+            assert!(pairing.error().is_none());
+        }
+        pairing
+            .complete(accepted, ConnectionRole::Responder)
+            .unwrap();
+        assert!(pairing.is_paired());
     }
 
     #[test]
@@ -371,13 +595,16 @@ mod tests {
                 .is_err()
         );
         let attempt = a.begin_incoming().unwrap();
-        a.invitation.as_mut().unwrap().attempt.expires = Instant::now();
+        let PairingState::Inviting(invitation) = &mut a.state else {
+            panic!()
+        };
+        invitation.attempt.expires = Instant::now();
         assert!(
             a.accept(peer(), &attempt, ConnectionRole::Responder)
                 .is_err()
         );
         a.join("123456", None).unwrap();
-        let attempt = a.request.as_ref().unwrap().attempt.clone();
+        let attempt = a.pending_request().unwrap().attempt.clone();
         a.cancel();
         assert!(
             a.accept(peer(), &attempt, ConnectionRole::Initiator)
@@ -390,7 +617,10 @@ mod tests {
         let a = pairing();
         let mut a = a.lock().unwrap();
         a.invite().unwrap();
-        let old_generation = a.invitation.as_ref().unwrap().attempt.generation;
+        let PairingState::Inviting(invitation) = &a.state else {
+            panic!()
+        };
+        let old_generation = invitation.attempt.generation;
         let attempts: Vec<_> = (0..MAX_ATTEMPTS)
             .map(|_| a.begin_incoming().unwrap())
             .collect();
@@ -398,7 +628,9 @@ mod tests {
         for attempt in attempts {
             a.failed(&attempt, ConnectionRole::Responder);
         }
-        let invitation = a.invitation.as_ref().unwrap();
+        let PairingState::Inviting(invitation) = &a.state else {
+            panic!()
+        };
         assert_ne!(invitation.attempt.generation, old_generation);
         assert_eq!(invitation.attempts, 0);
         assert!(a.invitation_code().is_some());
@@ -411,20 +643,25 @@ mod tests {
         let a = pairing();
         let mut a = a.lock().unwrap();
         a.invite().unwrap();
-        let old_generation = a.invitation.as_ref().unwrap().attempt.generation;
-        a.invitation.as_mut().unwrap().attempt.expires = Instant::now();
+        let PairingState::Inviting(invitation) = &mut a.state else {
+            panic!()
+        };
+        let old_generation = invitation.attempt.generation;
+        invitation.attempt.expires = Instant::now();
         assert!(a.invitation_code().is_none());
         assert!(a.is_inviting());
 
         a.expire();
 
-        let invitation = a.invitation.as_ref().unwrap();
+        let PairingState::Inviting(invitation) = &a.state else {
+            panic!()
+        };
         assert_ne!(invitation.attempt.generation, old_generation);
         assert_eq!(invitation.attempts, 0);
         assert!(invitation.attempt.expires > Instant::now());
         assert!(a.invitation_code().is_some());
         assert!(a.is_inviting());
-        assert!(a.error.is_none());
+        assert!(a.error().is_none());
         a.cancel();
         assert!(!a.is_inviting());
     }
@@ -434,14 +671,17 @@ mod tests {
         let a = pairing();
         let mut a = a.lock().unwrap();
         a.join("123456", None).unwrap();
-        a.request.as_mut().unwrap().started = true;
-        a.request.as_mut().unwrap().attempt.expires = Instant::now();
+        a.begin_outgoing().unwrap();
+        let PairingState::Joining(request) = &mut a.state else {
+            panic!()
+        };
+        request.attempt.expires = Instant::now();
 
         a.expire();
 
-        assert!(a.request.is_none());
+        assert!(a.pending_request().is_none());
         assert_eq!(
-            a.error.as_deref(),
+            a.error(),
             Some(crate::i18n::tr("pairing.code_expired").as_ref())
         );
     }
@@ -452,23 +692,27 @@ mod tests {
         let mut a = a.lock().unwrap();
         a.join("123456", None).unwrap();
         assert_eq!(a.join_progress(), Some(JoinProgress::Discovering));
-        a.request.as_mut().unwrap().discovery_deadline = Instant::now();
+        let PairingState::Joining(request) = &mut a.state else {
+            panic!()
+        };
+        request.discovery_deadline = Instant::now();
         a.expire();
         assert!(a.join_progress().is_none());
         assert!(
-            a.error
-                .as_deref()
+            a.error()
                 .unwrap()
                 .starts_with(crate::i18n::tr("pairing.device_not_found").as_ref())
         );
 
         a.join("123456", None).unwrap();
-        let request = a.request.as_mut().unwrap();
-        request.started = true;
+        a.begin_outgoing().unwrap();
+        let PairingState::Joining(request) = &mut a.state else {
+            panic!()
+        };
         request.discovery_deadline = Instant::now();
         a.expire();
         assert_eq!(a.join_progress(), Some(JoinProgress::Connecting));
-        assert!(a.error.is_none());
+        assert!(a.error().is_none());
     }
 
     #[test]
@@ -478,7 +722,7 @@ mod tests {
         let endpoint = "127.0.0.1:52134".parse().unwrap();
         a.join_at("123456", endpoint).unwrap();
         assert_eq!(a.join_progress(), Some(JoinProgress::Connecting));
-        let attempt = a.request.as_ref().unwrap().attempt.clone();
+        let attempt = a.pending_request().unwrap().attempt.clone();
         a.cancel();
         let mut remote = peer();
         remote.addresses = vec![endpoint];
@@ -488,12 +732,14 @@ mod tests {
         );
         assert!(a.store.config.peers.is_empty());
         a.join_at("123456", endpoint).unwrap();
-        a.request.as_mut().unwrap().discovery_deadline = Instant::now();
+        let PairingState::Joining(request) = &mut a.state else {
+            panic!()
+        };
+        request.discovery_deadline = Instant::now();
         a.expire();
-        assert!(a.request.is_none());
+        assert!(a.pending_request().is_none());
         assert!(
-            a.error
-                .as_deref()
+            a.error()
                 .unwrap()
                 .starts_with(crate::i18n::tr("pairing.manual_connection_failed").as_ref())
         );

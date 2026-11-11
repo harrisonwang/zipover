@@ -65,12 +65,12 @@ fn lan_round_trip() {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let mut state = pairing.lock().unwrap();
-            if state.result.is_some() {
+            if state.is_paired() {
                 assert_eq!(state.store.config.peers.len(), 1);
                 state.cancel();
                 break;
             }
-            if let Some(error) = &state.error {
+            if let Some(error) = state.error() {
                 bail!("pairing failed: {error}");
             }
             if Instant::now() >= deadline {
