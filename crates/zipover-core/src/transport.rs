@@ -2,7 +2,7 @@ use crate::config::{DeviceId, PairingKey, TrustedPeer};
 use crate::{
     crypto::{self, ConnectionRole},
     discovery::Discovery,
-    pairing::{PairAttempt, SharedPairing},
+    pairing::{JoinTarget, PairAttempt, SharedPairing},
     protocol::{FRAME_LIMIT, WireMessage},
     runtime::SyncOptions,
     sync::format_bytes,
@@ -251,7 +251,7 @@ pub(crate) fn network_loop(
     incoming: SyncSender<IncomingEvent>,
     options: SyncOptions,
 ) {
-    let mut jobs: Vec<(DeviceId, thread::JoinHandle<()>)> = Vec::new();
+    let mut jobs: Vec<(Option<DeviceId>, thread::JoinHandle<()>)> = Vec::new();
     let mut next_connect = Instant::now();
     while !hub.is_shutdown() {
         if let Some(discovery) = &mut discovery {
@@ -271,7 +271,7 @@ pub(crate) fn network_loop(
                     let shared = shared.clone();
                     let incoming = incoming.clone();
                     jobs.push((
-                        [0; 16],
+                        None,
                         thread::spawn(move || {
                             if let Err(error) = establish(stream, None, &hub, &shared, &incoming) {
                                 crate::i18n::localized!(eprintln, "transport.connection_rejected", error = error : {:#});
@@ -292,7 +292,7 @@ pub(crate) fn network_loop(
                 panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
             });
             let local_id = pairing.store.config.id;
-            let mut targets: Vec<(DeviceId, ConnectionAuth, PeerAddresses)> = Vec::new();
+            let mut targets: Vec<(ConnectionAuth, PeerAddresses)> = Vec::new();
             for trusted in &pairing.store.config.peers {
                 let mut addresses = Vec::new();
                 if (local_id < trusted.id || !trusted.addresses.is_empty())
@@ -309,69 +309,85 @@ pub(crate) fn network_loop(
                     .retain(|address| crate::address::validate_pairing_address(*address).is_ok());
                 if !addresses.is_empty() {
                     targets.push((
-                        trusted.id,
-                        ConnectionAuth::Trusted(trusted.key),
+                        ConnectionAuth::Trusted {
+                            id: trusted.id,
+                            key: trusted.key,
+                        },
                         PeerAddresses::Discovered(addresses),
                     ));
                 }
             }
             if let Some(request) = pairing.pending_request() {
-                let mut candidates: Vec<_> = pairing
-                    .discovered
-                    .iter()
-                    .filter(|p| {
-                        p.inviting
-                            && request
-                                .device
-                                .as_ref()
-                                .is_none_or(|d| *d == p.name || *d == hex::encode(p.id))
-                    })
-                    .collect();
-                let already_connected = candidates.iter().any(|peer| active.contains(&peer.id));
-                candidates.retain(|peer| !active.contains(&peer.id));
-                let target = if let Some(address) = request.endpoint {
-                    Some(([0; 16], PeerAddresses::Discovered(vec![address])))
-                } else if let Some(address) = &options.connect {
-                    Some(([0; 16], PeerAddresses::Explicit(address.clone())))
-                } else if candidates.len() == 1 {
-                    Some((
-                        candidates[0].id,
-                        PeerAddresses::Discovered(candidates[0].addresses.clone()),
-                    ))
-                } else {
-                    None
-                };
-                if let Some((id, addresses)) = target {
-                    if jobs.len() < MAX_PEERS
-                        && !jobs.iter().any(|(pending, _)| *pending == id)
-                        && let Some(attempt) = pairing.begin_outgoing()
-                    {
-                        targets.retain(|(other, ..)| *other != id);
-                        targets.insert(0, (id, ConnectionAuth::Pair(attempt), addresses));
+                let target = match (&request.target, &options.connect) {
+                    (JoinTarget::Address(address), _) => {
+                        Some((None, PeerAddresses::Discovered(vec![*address])))
                     }
-                } else if candidates.len() > 1 {
-                    pairing.fail_discovery(
-                        crate::i18n::tr("transport.multiple_pairing_devices").into(),
-                    );
-                } else if already_connected {
-                    pairing.fail_discovery(crate::i18n::tr("transport.already_connected").into());
+                    (JoinTarget::Discovery { .. }, Some(address)) => {
+                        Some((None, PeerAddresses::Explicit(address.clone())))
+                    }
+                    (JoinTarget::Discovery { device }, None) => {
+                        let mut candidates: Vec<_> = pairing
+                            .discovered
+                            .iter()
+                            .filter(|p| {
+                                p.inviting
+                                    && device
+                                        .as_ref()
+                                        .is_none_or(|d| *d == p.name || *d == hex::encode(p.id))
+                            })
+                            .collect();
+                        let already_connected =
+                            candidates.iter().any(|peer| active.contains(&peer.id));
+                        candidates.retain(|peer| !active.contains(&peer.id));
+                        if candidates.len() == 1 {
+                            Some((
+                                Some(candidates[0].id),
+                                PeerAddresses::Discovered(candidates[0].addresses.clone()),
+                            ))
+                        } else {
+                            if candidates.len() > 1 {
+                                pairing.fail_discovery(
+                                    crate::i18n::tr("transport.multiple_pairing_devices").into(),
+                                );
+                            } else if already_connected {
+                                pairing.fail_discovery(
+                                    crate::i18n::tr("transport.already_connected").into(),
+                                );
+                            }
+                            None
+                        }
+                    }
+                };
+                if let Some((id, addresses)) = target
+                    && jobs.len() < MAX_PEERS
+                    && id.is_none_or(|id| !jobs.iter().any(|(pending, _)| *pending == Some(id)))
+                    && let Some(attempt) = pairing.begin_outgoing()
+                {
+                    if let Some(id) = id {
+                        targets.retain(|(auth, _)| auth.device_id() != Some(id));
+                    }
+                    targets.insert(0, (ConnectionAuth::Pair { id, attempt }, addresses));
                 }
             } else if pairing.join_progress().is_none()
                 && let Some(address) = &options.connect
                 && pairing.store.config.peers.len() == 1
             {
                 let peer = &pairing.store.config.peers[0];
-                targets.retain(|(other, ..)| *other != peer.id);
+                targets.retain(|(auth, _)| auth.device_id() != Some(peer.id));
                 targets.push((
-                    peer.id,
-                    ConnectionAuth::Trusted(peer.key),
+                    ConnectionAuth::Trusted {
+                        id: peer.id,
+                        key: peer.key,
+                    },
                     PeerAddresses::Explicit(address.clone()),
                 ));
             }
             drop(pairing);
-            for (id, auth, addresses) in targets {
-                if (active.contains(&id) && matches!(auth, ConnectionAuth::Trusted(_)))
-                    || jobs.iter().any(|(pending, _)| *pending == id)
+            for (auth, addresses) in targets {
+                let device_id = auth.device_id();
+                if matches!(auth, ConnectionAuth::Trusted { id, .. } if active.contains(&id))
+                    || device_id
+                        .is_some_and(|id| jobs.iter().any(|(pending, _)| *pending == Some(id)))
                     || jobs.len() >= MAX_PEERS
                 {
                     continue;
@@ -380,17 +396,17 @@ pub(crate) fn network_loop(
                 let shared = shared.clone();
                 let incoming = incoming.clone();
                 jobs.push((
-                    id,
+                    device_id,
                     thread::spawn(move || {
                         let result = match &auth {
-                            ConnectionAuth::Trusted(key) => connect_trusted_addresses(
-                                addresses, id, *key, &hub, &shared, &incoming,
+                            ConnectionAuth::Trusted { id, key } => connect_trusted_addresses(
+                                addresses, *id, *key, &hub, &shared, &incoming,
                             ),
-                            ConnectionAuth::Pair(_) => {
+                            ConnectionAuth::Pair { .. } => {
                                 connect_addresses(addresses).and_then(|stream| {
                                     establish(
                                         stream,
-                                        Some((id, auth.clone())),
+                                        Some(auth.clone()),
                                         &hub,
                                         &shared,
                                         &incoming,
@@ -399,8 +415,9 @@ pub(crate) fn network_loop(
                             }
                         };
                         if let Err(error) = result {
-                            crate::i18n::localized!(eprintln, "transport.connect_failed", device = hex::encode(id), error = error : {:#});
-                            if let ConnectionAuth::Pair(attempt) = &auth {
+                            let label = device_id.map_or_else(|| "pairing".into(), hex::encode);
+                            crate::i18n::localized!(eprintln, "transport.connect_failed", device = label, error = error : {:#});
+                            if let ConnectionAuth::Pair { attempt, .. } = &auth {
                                 shared
                                     .lock()
                                     .unwrap_or_else(|error| panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned")))
@@ -460,7 +477,7 @@ fn connect_trusted_addresses(
             .and_then(|stream| {
                 establish(
                     stream,
-                    Some((id, ConnectionAuth::Trusted(key))),
+                    Some(ConnectionAuth::Trusted { id, key }),
                     hub,
                     shared,
                     incoming,
@@ -490,13 +507,28 @@ fn connect_addresses(addresses: PeerAddresses) -> Result<TcpStream> {
 
 #[derive(Clone)]
 enum ConnectionAuth {
-    Trusted(PairingKey),
-    Pair(PairAttempt),
+    Trusted {
+        id: DeviceId,
+        key: PairingKey,
+    },
+    Pair {
+        id: Option<DeviceId>,
+        attempt: PairAttempt,
+    },
+}
+
+impl ConnectionAuth {
+    fn device_id(&self) -> Option<DeviceId> {
+        match self {
+            Self::Trusted { id, .. } => Some(*id),
+            Self::Pair { id, .. } => *id,
+        }
+    }
 }
 
 fn establish(
     mut stream: TcpStream,
-    target: Option<(DeviceId, ConnectionAuth)>,
+    target: Option<ConnectionAuth>,
     hub: &PeerHub,
     shared: &SharedPairing,
     incoming: &SyncSender<IncomingEvent>,
@@ -512,18 +544,20 @@ fn establish(
         (pairing.store.config.id, pairing.store.config.name.clone())
     };
     let mut preface = [0; PREFACE_LEN];
-    let (role, mut id, auth) = if let Some((id, auth)) = target {
+    let (role, auth) = if let Some(auth) = target {
         preface[..5].copy_from_slice(MAGIC);
         preface[5..21].copy_from_slice(&local_id);
-        preface[21..37].copy_from_slice(&id);
+        if let Some(id) = auth.device_id() {
+            preface[21..37].copy_from_slice(&id);
+        }
         // 模式 1 对应旧的长配对码流程，不能将其解释为数字配对码。
-        preface[37] = if matches!(auth, ConnectionAuth::Pair(_)) {
+        preface[37] = if matches!(auth, ConnectionAuth::Pair { .. }) {
             2
         } else {
             0
         };
         stream.write_all(&preface)?;
-        (ConnectionRole::Initiator, id, auth)
+        (ConnectionRole::Initiator, auth)
     } else {
         stream.read_exact(&mut preface)?;
         let pairing_mode = preface[37] == 2;
@@ -543,37 +577,50 @@ fn establish(
             panic!("{}: {error:?}", crate::i18n::tr("pairing.lock_poisoned"))
         });
         let auth = if pairing_mode {
-            ConnectionAuth::Pair(pairing.begin_incoming()?)
+            ConnectionAuth::Pair {
+                id: Some(id),
+                attempt: pairing.begin_incoming()?,
+            }
         } else {
-            ConnectionAuth::Trusted(pairing.key_for(id)?)
+            ConnectionAuth::Trusted {
+                id,
+                key: pairing.key_for(id)?,
+            }
         };
-        (ConnectionRole::Responder, id, auth)
+        (ConnectionRole::Responder, auth)
     };
     let result = (|| -> Result<()> {
-        if id == local_id {
+        if auth.device_id() == Some(local_id) {
             crate::i18n::localized!(bail, "transport.self_connection")
         }
         let mut context = preface.to_vec();
-        let key = match &auth {
-            ConnectionAuth::Trusted(key) => *key,
-            ConnectionAuth::Pair(attempt) => {
+        let (id, key) = match &auth {
+            ConnectionAuth::Trusted { id, key } => (*id, *key),
+            ConnectionAuth::Pair {
+                id: expected_id,
+                attempt,
+            } => {
                 // 为手动地址连接返回响应端 ID；即使调用方事先未知该 ID，
                 // 也要将其同时绑定到 PAKE 和 Noise。
-                let mut responder = local_id;
-                if role == ConnectionRole::Initiator {
+                let (remote_id, responder) = if let Some(initiator) =
+                    (*expected_id).filter(|_| role == ConnectionRole::Responder)
+                {
+                    stream.write_all(&local_id)?;
+                    (initiator, local_id)
+                } else {
+                    let mut responder = [0; 16];
                     stream.read_exact(&mut responder)?;
-                    if id != [0; 16] && id != responder {
+                    if expected_id.is_some_and(|expected| expected != responder) {
                         crate::i18n::localized!(bail, "transport.remote_mismatch")
                     }
-                    id = responder;
-                    if id == local_id {
+                    if responder == local_id {
                         crate::i18n::localized!(bail, "transport.self_connection")
                     }
-                } else {
-                    stream.write_all(&responder)?;
-                }
+                    (responder, responder)
+                };
                 context.extend_from_slice(&responder);
-                crypto::pairing_key(&mut stream, role, &attempt.code, &context)?
+                let key = crypto::pairing_key(&mut stream, role, &attempt.code, &context)?;
+                (remote_id, key)
             }
         };
         let (mut writer, mut reader) = crypto::handshake(&mut stream, role, &key, &context)?;
@@ -583,7 +630,7 @@ fn establish(
         if remote_name.len() > 255 || remote_name.chars().any(char::is_control) {
             crate::i18n::localized!(bail, "transport.invalid_name")
         }
-        if let ConnectionAuth::Pair(attempt) = &auth {
+        if let ConnectionAuth::Pair { attempt, .. } = &auth {
             let peer = TrustedPeer {
                 id,
                 key,
@@ -648,7 +695,7 @@ fn establish(
         )
     })();
     if result.is_err()
-        && let ConnectionAuth::Pair(attempt) = &auth
+        && let ConnectionAuth::Pair { attempt, .. } = &auth
     {
         shared
             .lock()
@@ -838,7 +885,7 @@ mod tests {
         assert!(
             establish(
                 stream,
-                Some((id, ConnectionAuth::Trusted([0; 32]))),
+                Some(ConnectionAuth::Trusted { id, key: [0; 32] }),
                 &hub,
                 &a,
                 &tx
@@ -860,11 +907,7 @@ mod tests {
     ) -> (bool, bool) {
         a.lock().unwrap().join(code, None).unwrap();
         let attempt = a.lock().unwrap().begin_outgoing().unwrap();
-        let target_id = if known_target {
-            b.lock().unwrap().store.config.id
-        } else {
-            [0; 16]
-        };
+        let target_id = known_target.then(|| b.lock().unwrap().store.config.id);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let b = b.clone();
@@ -876,7 +919,10 @@ mod tests {
         let (tx, _rx) = mpsc::sync_channel(1);
         let accepted = establish(
             TcpStream::connect(address).unwrap(),
-            Some((target_id, ConnectionAuth::Pair(attempt))),
+            Some(ConnectionAuth::Pair {
+                id: target_id,
+                attempt,
+            }),
             &PeerHub::default(),
             a,
             &tx,

@@ -39,11 +39,14 @@ struct Invitation {
     attempts: u8,
 }
 
+pub(crate) enum JoinTarget {
+    Discovery { device: Option<String> },
+    Address(SocketAddr),
+}
+
 pub(crate) struct PairRequest {
     attempt: PairAttempt,
-    pub device: Option<String>,
-    pub endpoint: Option<SocketAddr>,
-    started: bool,
+    pub target: JoinTarget,
     discovery_deadline: Instant,
 }
 
@@ -51,6 +54,7 @@ enum PairingState {
     Idle,
     Inviting(Invitation),
     Joining(PairRequest),
+    Connecting(PairAttempt),
     Confirming {
         attempt: PairAttempt,
         role: ConnectionRole,
@@ -142,14 +146,16 @@ impl Pairing {
 
     pub fn join_progress(&self) -> Option<JoinProgress> {
         match &self.state {
-            PairingState::Joining(request) => {
-                Some(if request.started || request.endpoint.is_some() {
-                    JoinProgress::Connecting
-                } else {
-                    JoinProgress::Discovering
-                })
-            }
-            PairingState::Confirming {
+            PairingState::Joining(PairRequest {
+                target: JoinTarget::Discovery { .. },
+                ..
+            }) => Some(JoinProgress::Discovering),
+            PairingState::Joining(PairRequest {
+                target: JoinTarget::Address(_),
+                ..
+            })
+            | PairingState::Connecting(_)
+            | PairingState::Confirming {
                 role: ConnectionRole::Initiator,
                 ..
             } => Some(JoinProgress::Connecting),
@@ -170,42 +176,36 @@ impl Pairing {
 
     pub(crate) fn pending_request(&self) -> Option<&PairRequest> {
         match &self.state {
-            PairingState::Joining(request) if !request.started => Some(request),
+            PairingState::Joining(request) => Some(request),
             _ => None,
         }
     }
 
     pub(crate) fn begin_outgoing(&mut self) -> Option<PairAttempt> {
-        match &mut self.state {
-            PairingState::Joining(request) if !request.started => {
-                request.started = true;
-                Some(request.attempt.clone())
-            }
-            _ => None,
-        }
+        let PairingState::Joining(request) = &self.state else {
+            return None;
+        };
+        let attempt = request.attempt.clone();
+        self.state = PairingState::Connecting(attempt.clone());
+        Some(attempt)
     }
 
     pub(crate) fn fail_discovery(&mut self, error: String) {
-        if self.pending_request().is_some() {
+        if matches!(self.state, PairingState::Joining(_)) {
             self.state = PairingState::Failed(error);
         }
     }
 
     pub fn join(&mut self, code: &str, device: Option<String>) -> Result<()> {
-        self.request_pairing(code, device, None)
+        self.request_pairing(code, JoinTarget::Discovery { device })
     }
 
     pub fn join_at(&mut self, code: &str, endpoint: SocketAddr) -> Result<()> {
         crate::address::validate_pairing_address(endpoint)?;
-        self.request_pairing(code, None, Some(endpoint))
+        self.request_pairing(code, JoinTarget::Address(endpoint))
     }
 
-    fn request_pairing(
-        &mut self,
-        code: &str,
-        device: Option<String>,
-        endpoint: Option<SocketAddr>,
-    ) -> Result<()> {
+    fn request_pairing(&mut self, code: &str, target: JoinTarget) -> Result<()> {
         let code = parse_code(code)?;
         let attempt = PairAttempt {
             generation: random_bytes()?,
@@ -215,9 +215,7 @@ impl Pairing {
         };
         self.state = PairingState::Joining(PairRequest {
             attempt,
-            device,
-            endpoint,
-            started: false,
+            target,
             discovery_deadline: Instant::now() + DISCOVERY_TIMEOUT,
         });
         Ok(())
@@ -259,7 +257,7 @@ impl Pairing {
         role: ConnectionRole,
     ) -> Result<()> {
         let current = match (&self.state, role) {
-            (PairingState::Joining(request), ConnectionRole::Initiator) => Some(&request.attempt),
+            (PairingState::Connecting(attempt), ConnectionRole::Initiator) => Some(attempt),
             (PairingState::Inviting(invitation), ConnectionRole::Responder) => {
                 Some(&invitation.attempt)
             }
@@ -294,9 +292,9 @@ impl Pairing {
 
     pub(crate) fn failed(&mut self, attempt: &PairAttempt, role: ConnectionRole) {
         match &self.state {
-            PairingState::Joining(request)
+            PairingState::Connecting(current)
                 if role == ConnectionRole::Initiator
-                    && request.attempt.generation == attempt.generation =>
+                    && current.generation == attempt.generation =>
             {
                 self.state =
                     PairingState::Failed(crate::i18n::tr("pairing.connection_failed").into());
@@ -329,19 +327,19 @@ impl Pairing {
                 // 轮换短期配对码时持续保留邀请广播。
                 self.renew_invitation();
             }
-            PairingState::Joining(request)
-                if !request.started && request.discovery_deadline <= now =>
-            {
+            PairingState::Joining(request) if request.discovery_deadline <= now => {
                 self.state = PairingState::Failed(
-                    if request.endpoint.is_some() {
-                        crate::i18n::tr("pairing.manual_connection_failed")
-                    } else {
-                        crate::i18n::tr("pairing.device_not_found")
+                    match request.target {
+                        JoinTarget::Address(_) => {
+                            crate::i18n::tr("pairing.manual_connection_failed")
+                        }
+                        JoinTarget::Discovery { .. } => crate::i18n::tr("pairing.device_not_found"),
                     }
                     .into(),
                 );
             }
             PairingState::Joining(PairRequest { attempt, .. })
+            | PairingState::Connecting(attempt)
             | PairingState::Confirming { attempt, .. }
                 if attempt.expires <= now =>
             {
@@ -672,10 +670,10 @@ mod tests {
         let mut a = a.lock().unwrap();
         a.join("123456", None).unwrap();
         a.begin_outgoing().unwrap();
-        let PairingState::Joining(request) = &mut a.state else {
+        let PairingState::Connecting(attempt) = &mut a.state else {
             panic!()
         };
-        request.attempt.expires = Instant::now();
+        attempt.expires = Instant::now();
 
         a.expire();
 
@@ -705,11 +703,11 @@ mod tests {
         );
 
         a.join("123456", None).unwrap();
-        a.begin_outgoing().unwrap();
         let PairingState::Joining(request) = &mut a.state else {
             panic!()
         };
         request.discovery_deadline = Instant::now();
+        a.begin_outgoing().unwrap();
         a.expire();
         assert_eq!(a.join_progress(), Some(JoinProgress::Connecting));
         assert!(a.error().is_none());
