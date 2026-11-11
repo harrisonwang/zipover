@@ -65,7 +65,6 @@
   "files.nonsequential_offset": "Nonsequential file chunk offset: expected %{expected}, received %{received}",
   "files.declared_size_exceeded": "The received file exceeds its declared size",
   "files.create_temporary_failed": "Unable to create temporary file: %{path}",
-  "files.handle_closed": "The received file handle is closed",
   "files.write_chunk_failed": "Unable to write file chunk",
   "files.invalid_completion_index": "Invalid completed file index",
   "files.already_complete": "The file is already complete",

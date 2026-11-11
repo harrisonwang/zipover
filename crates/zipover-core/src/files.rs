@@ -382,7 +382,7 @@ pub(crate) struct IncomingTransfer {
     entries: Vec<TransferEntry>,
     files: Vec<IncomingFile>,
     pub(crate) roots: Vec<PathBuf>,
-    committed: bool,
+    // 未提交传输的目录租约；`finish` 成功后移交给 `FinishedTransfer`，否则在 `Drop` 中回收目录。
     lock: Option<File>,
 }
 
@@ -390,10 +390,16 @@ struct IncomingFile {
     final_path: PathBuf,
     temporary_path: PathBuf,
     expected_size: u64,
-    received_size: u64,
-    hasher: Sha256,
-    file: Option<File>,
-    finished: bool,
+    state: IncomingFileState,
+}
+
+enum IncomingFileState {
+    Receiving {
+        received_size: u64,
+        hasher: Sha256,
+        file: Option<File>,
+    },
+    Finished,
 }
 
 pub(crate) struct FinishedTransfer {
@@ -559,10 +565,11 @@ impl IncomingTransfer {
                         final_path,
                         temporary_path,
                         expected_size: entry.size,
-                        received_size: 0,
-                        hasher: Sha256::new(),
-                        file: None,
-                        finished: false,
+                        state: IncomingFileState::Receiving {
+                            received_size: 0,
+                            hasher: Sha256::new(),
+                            file: None,
+                        },
                     });
                 }
             }
@@ -578,7 +585,6 @@ impl IncomingTransfer {
             entries,
             files,
             roots,
-            committed: false,
             lock: Some(lock),
         })
     }
@@ -592,76 +598,83 @@ impl IncomingTransfer {
         if bytes.is_empty() || bytes.len() > CHUNK_SIZE {
             crate::i18n::localized!(bail, "files.invalid_chunk_size")
         }
-        let file = self
+        let entry = self
             .files
             .get_mut(file_index as usize)
             .context(crate::i18n::tr("files.invalid_chunk_index"))?;
-        if file.finished {
+        let IncomingFileState::Receiving {
+            received_size,
+            hasher,
+            file,
+        } = &mut entry.state
+        else {
             crate::i18n::localized!(bail, "files.chunk_after_completion")
-        }
-        if offset != file.received_size {
+        };
+        if offset != *received_size {
             crate::i18n::localized!(
                 bail,
                 "files.nonsequential_offset",
-                expected = file.received_size,
+                expected = *received_size,
                 received = offset
             )
         }
-        let next_size = file.received_size + bytes.len() as u64;
-        if next_size > file.expected_size {
+        let next_size = *received_size + bytes.len() as u64;
+        if next_size > entry.expected_size {
             crate::i18n::localized!(bail, "files.declared_size_exceeded")
         }
 
-        if file.file.is_none() {
-            file.file = Some(create_private_file(&file.temporary_path).with_context(|| {
+        let handle = match file {
+            Some(handle) => handle,
+            None => file.insert(create_private_file(&entry.temporary_path).with_context(|| {
                 crate::i18n::localized!(
                     format,
                     "files.create_temporary_failed",
-                    path = file.temporary_path.display()
+                    path = entry.temporary_path.display()
                 )
-            })?);
-        }
-        let handle = file
-            .file
-            .as_mut()
-            .context(crate::i18n::tr("files.handle_closed"))?;
+            })?),
+        };
         handle
             .write_all(bytes)
             .context(crate::i18n::tr("files.write_chunk_failed"))?;
-        file.hasher.update(bytes);
-        file.received_size = next_size;
+        hasher.update(bytes);
+        *received_size = next_size;
         Ok(())
     }
 
     pub(crate) fn finish_file(&mut self, file_index: u32, expected_sha256: [u8; 32]) -> Result<()> {
-        let file = self
+        let entry = self
             .files
             .get_mut(file_index as usize)
             .context(crate::i18n::tr("files.invalid_completion_index"))?;
-        if file.finished {
+        let IncomingFileState::Receiving {
+            received_size,
+            hasher,
+            file,
+        } = &mut entry.state
+        else {
             crate::i18n::localized!(bail, "files.already_complete")
-        }
-        if file.received_size != file.expected_size {
+        };
+        if *received_size != entry.expected_size {
             crate::i18n::localized!(
                 bail,
                 "files.size_mismatch",
-                expected = file.expected_size,
-                received = file.received_size
+                expected = entry.expected_size,
+                received = *received_size
             )
         }
 
-        let actual_sha256: [u8; 32] = file.hasher.clone().finalize().into();
+        let actual_sha256: [u8; 32] = hasher.clone().finalize().into();
         if actual_sha256 != expected_sha256 {
             crate::i18n::localized!(bail, "files.checksum_mismatch")
         }
 
-        let mut handle = match file.file.take() {
+        let mut handle = match file.take() {
             Some(handle) => handle,
-            None => create_private_file(&file.temporary_path).with_context(|| {
+            None => create_private_file(&entry.temporary_path).with_context(|| {
                 crate::i18n::localized!(
                     format,
                     "files.create_empty_failed",
-                    path = file.temporary_path.display()
+                    path = entry.temporary_path.display()
                 )
             })?,
         };
@@ -669,26 +682,30 @@ impl IncomingTransfer {
             .flush()
             .context(crate::i18n::tr("files.flush_failed"))?;
         drop(handle);
-        fs::hard_link(&file.temporary_path, &file.final_path).with_context(|| {
+        fs::hard_link(&entry.temporary_path, &entry.final_path).with_context(|| {
             crate::i18n::localized!(
                 format,
                 "files.commit_failed",
-                path = file.final_path.display()
+                path = entry.final_path.display()
             )
         })?;
-        fs::remove_file(&file.temporary_path).with_context(|| {
+        fs::remove_file(&entry.temporary_path).with_context(|| {
             crate::i18n::localized!(
                 format,
                 "files.remove_temporary_failed",
-                path = file.temporary_path.display()
+                path = entry.temporary_path.display()
             )
         })?;
-        file.finished = true;
+        entry.state = IncomingFileState::Finished;
         Ok(())
     }
 
     pub(crate) fn finish(mut self) -> Result<FinishedTransfer> {
-        if self.files.iter().any(|file| !file.finished) {
+        if !self
+            .files
+            .iter()
+            .all(|file| matches!(file.state, IncomingFileState::Finished))
+        {
             crate::i18n::localized!(bail, "files.verification_incomplete")
         }
         // 先读取元数据计算指纹，再恢复目录权限，避免无权进入目录时无法完成收尾。
@@ -709,7 +726,6 @@ impl IncomingTransfer {
         }
         // 完成时间与容量信息保留在私有父目录中，不受源文件权限影响。
         create_private_file(&self.directory.join(".complete"))?;
-        self.committed = true;
         Ok(FinishedTransfer {
             fingerprint: local_fingerprint,
             roots: std::mem::take(&mut self.roots),
@@ -725,10 +741,10 @@ impl IncomingTransfer {
 
 impl Drop for IncomingTransfer {
     fn drop(&mut self) {
-        if !self.committed {
+        if let Some(lock) = self.lock.take() {
             self.files.clear();
             let _cache_lock = lock_cache(&cache_directory()).ok();
-            self.lock.take();
+            drop(lock);
             let _ = remove_cached_directory(&self.directory);
         }
     }
