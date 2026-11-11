@@ -55,18 +55,18 @@ impl SessionKey {
     }
 }
 
-struct ActiveTransfer {
+/// 进行中的接收会话。会话只能经 `end_session` 或成功应用离开此表，
+/// 二者都会把终态写入 `receipts`，迟到或重复的同 ID 消息据此直接答复。
+struct Session {
     version: ClipboardVersion,
     last_activity: Instant,
     size: u64,
-    transfer: IncomingTransfer,
+    payload: IncomingPayload,
 }
 
-struct ActiveImage {
-    version: ClipboardVersion,
-    last_activity: Instant,
-    image: IncomingImage,
-    size: u64,
+enum IncomingPayload {
+    Files(IncomingTransfer),
+    Image(IncomingImage),
 }
 
 /// 当前剪贴板版本对单个对端的投递进度；不在表中表示仍待投递。
@@ -101,8 +101,7 @@ struct SyncState {
     last_receive_error: Option<String>,
     last_send_error: Option<String>,
     receipts: RecentDeliveries,
-    active_transfers: HashMap<SessionKey, ActiveTransfer>,
-    active_images: HashMap<SessionKey, ActiveImage>,
+    sessions: HashMap<SessionKey, Session>,
 }
 
 impl SyncState {
@@ -119,8 +118,7 @@ impl SyncState {
             last_receive_error: None,
             last_send_error: None,
             receipts: RecentDeliveries::default(),
-            active_transfers: HashMap::new(),
-            active_images: HashMap::new(),
+            sessions: HashMap::new(),
         }
     }
 
@@ -283,18 +281,19 @@ pub(crate) fn clipboard_loop(
                     ) && let Ok(Some(payload)) = capture_payload(&mut clipboard, &mut cache)
                     {
                         state.observe_local_payload(&payload);
-                        discard_obsolete_transfers(&mut state, &hub);
+                        discard_obsolete_sessions(&mut state, &hub);
                     }
                     let id = message_id(message).to_owned();
                     let peer_id = *peer_id;
                     if let Err(error) =
                         handle_incoming_event(event, &mut clipboard, &mut state, &hub)
                     {
-                        let key = SessionKey::new(peer_id, id.clone());
-                        state.active_transfers.remove(&key);
-                        state.active_images.remove(&key);
-                        state.receipts.insert(&id, DeliveryStatus::Rejected);
-                        reply(&hub, peer_id, &id, DeliveryStatus::Rejected);
+                        end_session(
+                            &mut state,
+                            &hub,
+                            SessionKey::new(peer_id, id),
+                            DeliveryStatus::Rejected,
+                        );
                         let message = format!("{error:#}");
                         eprintln!("{message}");
                         state.last_receive_error = Some(message);
@@ -332,7 +331,7 @@ pub(crate) fn clipboard_loop(
                     Ok(Some(payload)) => {
                         state.last_capture_error = None;
                         if state.observe_local_payload(&payload) {
-                            discard_obsolete_transfers(&mut state, &hub);
+                            discard_obsolete_sessions(&mut state, &hub);
                             if state.applied_version == Some(state.version) {
                                 let payload = Arc::new(payload);
                                 for peer_id in state.delivery_targets(&peers, Instant::now()) {
@@ -530,6 +529,35 @@ fn reply(hub: &PeerHub, peer_id: u64, id: &str, status: DeliveryStatus) {
     );
 }
 
+/// 记录消息终态并答复发送端；`receipts` 让迟到或重复的同 ID 消息直接复用该结果。
+fn conclude(state: &mut SyncState, hub: &PeerHub, peer_id: u64, id: &str, status: DeliveryStatus) {
+    state.receipts.insert(id, status);
+    reply(hub, peer_id, id, status);
+}
+
+/// 中止进行中的接收会话（若存在）并记录终态；丢弃会话会释放缓存与资源配额。
+fn end_session(state: &mut SyncState, hub: &PeerHub, key: SessionKey, status: DeliveryStatus) {
+    state.sessions.remove(&key);
+    conclude(state, hub, key.peer_id, &key.message_id, status);
+}
+
+fn end_sessions(
+    state: &mut SyncState,
+    hub: &PeerHub,
+    status: DeliveryStatus,
+    ended: impl Fn(&Session) -> bool,
+) {
+    let keys: Vec<_> = state
+        .sessions
+        .iter()
+        .filter(|(_, session)| ended(session))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in keys {
+        end_session(state, hub, key, status);
+    }
+}
+
 fn accept_version(
     state: &mut SyncState,
     hub: &PeerHub,
@@ -538,55 +566,25 @@ fn accept_version(
     version: ClipboardVersion,
 ) -> bool {
     if version < state.version {
-        state.receipts.insert(id, DeliveryStatus::Superseded);
-        reply(hub, peer_id, id, DeliveryStatus::Superseded);
+        conclude(state, hub, peer_id, id, DeliveryStatus::Superseded);
         return false;
     }
     if state.applied_version == Some(version) {
-        state.receipts.insert(id, DeliveryStatus::Applied);
-        reply(hub, peer_id, id, DeliveryStatus::Applied);
+        conclude(state, hub, peer_id, id, DeliveryStatus::Applied);
         return false;
     }
     if version > state.version {
         state.version = version;
         state.reset_deliveries();
-        discard_obsolete_transfers(state, hub);
+        discard_obsolete_sessions(state, hub);
     }
     true
 }
 
-fn discard_obsolete_transfers(state: &mut SyncState, hub: &PeerHub) {
-    state.active_transfers.retain(|key, active| {
-        if active.version < state.version {
-            state
-                .receipts
-                .insert(&key.message_id, DeliveryStatus::Superseded);
-            reply(
-                hub,
-                key.peer_id,
-                &key.message_id,
-                DeliveryStatus::Superseded,
-            );
-            false
-        } else {
-            true
-        }
-    });
-    state.active_images.retain(|key, active| {
-        if active.version < state.version {
-            state
-                .receipts
-                .insert(&key.message_id, DeliveryStatus::Superseded);
-            reply(
-                hub,
-                key.peer_id,
-                &key.message_id,
-                DeliveryStatus::Superseded,
-            );
-            false
-        } else {
-            true
-        }
+fn discard_obsolete_sessions(state: &mut SyncState, hub: &PeerHub) {
+    let current = state.version;
+    end_sessions(state, hub, DeliveryStatus::Superseded, |session| {
+        session.version < current
     });
 }
 
@@ -600,7 +598,7 @@ fn handle_incoming_event(
         IncomingEvent::Message { peer_id, message } => (peer_id, message),
         IncomingEvent::Disconnected { peer_id } => {
             state.deliveries.remove(&peer_id);
-            cleanup_peer_sessions(state, peer_id);
+            state.sessions.retain(|key, _| key.peer_id != peer_id);
             return Ok(());
         }
     };
@@ -633,9 +631,8 @@ fn handle_incoming_event(
             clipboard
                 .set_text(text)
                 .context(crate::i18n::tr("clipboard.write_text_failed"))?;
-            state.receipts.insert(&id, DeliveryStatus::Applied);
             mark_remote_applied(state, fingerprint, peer_id, version);
-            reply(hub, peer_id, &id, DeliveryStatus::Applied);
+            conclude(state, hub, peer_id, &id, DeliveryStatus::Applied);
             crate::i18n::localized!(eprintln, "sync.applied", summary = summary);
         }
         WireMessage::TransferStart {
@@ -647,8 +644,15 @@ fn handle_incoming_event(
                 return Ok(());
             }
             let key = SessionKey::new(peer_id, id.clone());
-            state.active_transfers.remove(&key);
-            if state.active_transfers.len() >= MAX_ACTIVE_TRANSFERS {
+            state.sessions.remove(&key);
+            let (count, active_size) = state
+                .sessions
+                .values()
+                .filter(|session| matches!(session.payload, IncomingPayload::Files(_)))
+                .fold((0, 0u64), |(count, size), session| {
+                    (count + 1, size + session.size)
+                });
+            if count >= MAX_ACTIVE_TRANSFERS {
                 crate::i18n::localized!(bail, "sync.too_many_file_transfers");
             }
             let Some(transfer_size) = entries
@@ -657,11 +661,6 @@ fn handle_incoming_event(
             else {
                 crate::i18n::localized!(bail, "sync.file_size_overflow");
             };
-            let active_size = state
-                .active_transfers
-                .values()
-                .map(|active| active.size)
-                .sum::<u64>();
             if active_size.saturating_add(transfer_size) > MAX_ACTIVE_TRANSFER_BYTES {
                 crate::i18n::localized!(bail, "sync.file_size_limit");
             }
@@ -674,13 +673,13 @@ fn handle_incoming_event(
                 "sync.receiving_files",
                 summary = transfer.summary()
             );
-            state.active_transfers.insert(
+            state.sessions.insert(
                 key,
-                ActiveTransfer {
+                Session {
                     version,
                     last_activity: Instant::now(),
                     size: transfer_size,
-                    transfer,
+                    payload: IncomingPayload::Files(transfer),
                 },
             );
         }
@@ -691,11 +690,16 @@ fn handle_incoming_event(
             bytes,
         } => {
             let key = SessionKey::new(peer_id, id);
-            let Some(active) = state.active_transfers.get_mut(&key) else {
+            let Some(Session {
+                last_activity,
+                payload: IncomingPayload::Files(transfer),
+                ..
+            }) = state.sessions.get_mut(&key)
+            else {
                 return Ok(());
             };
-            active.last_activity = Instant::now();
-            if let Err(error) = active.transfer.accept_chunk(file_index, offset, &bytes) {
+            *last_activity = Instant::now();
+            if let Err(error) = transfer.accept_chunk(file_index, offset, &bytes) {
                 return Err(
                     crate::i18n::localized!(anyhow, "sync.file_chunk_failed", error = error : {:#}),
                 );
@@ -707,11 +711,16 @@ fn handle_incoming_event(
             sha256,
         } => {
             let key = SessionKey::new(peer_id, id);
-            let Some(active) = state.active_transfers.get_mut(&key) else {
+            let Some(Session {
+                last_activity,
+                payload: IncomingPayload::Files(transfer),
+                ..
+            }) = state.sessions.get_mut(&key)
+            else {
                 return Ok(());
             };
-            active.last_activity = Instant::now();
-            if let Err(error) = active.transfer.finish_file(file_index, sha256) {
+            *last_activity = Instant::now();
+            if let Err(error) = transfer.finish_file(file_index, sha256) {
                 return Err(
                     crate::i18n::localized!(anyhow, "sync.file_verification_failed", error = error : {:#}),
                 );
@@ -719,13 +728,17 @@ fn handle_incoming_event(
         }
         WireMessage::TransferEnd { id } => {
             let key = SessionKey::new(peer_id, id.clone());
-            let Some(active) = state.active_transfers.remove(&key) else {
+            let Some(Session {
+                version,
+                payload: IncomingPayload::Files(transfer),
+                ..
+            }) = state.sessions.remove(&key)
+            else {
                 crate::i18n::localized!(eprintln, "sync.file_transfer_missing", id = id);
                 return Ok(());
             };
-            let version = active.version;
-            let summary = active.transfer.summary();
-            let finished = active.transfer.finish().map_err(|error| {
+            let summary = transfer.summary();
+            let finished = transfer.finish().map_err(|error| {
                 crate::i18n::localized!(anyhow, "sync.file_completion_failed", error = error : {:#})
             })?;
             if let Err(error) = set_file_list(clipboard, &finished.roots) {
@@ -734,18 +747,16 @@ fn handle_incoming_event(
                     crate::i18n::localized!(anyhow, "sync.write_file_list_failed", error = error : {:#}),
                 );
             }
-            state.receipts.insert(&id, DeliveryStatus::Applied);
             mark_remote_applied(state, finished.fingerprint, peer_id, version);
-            reply(hub, peer_id, &id, DeliveryStatus::Applied);
+            conclude(state, hub, peer_id, &id, DeliveryStatus::Applied);
             cleanup_file_cache(clipboard, state);
             crate::i18n::localized!(eprintln, "sync.completed", summary = summary);
         }
         WireMessage::TransferAbort { id } => {
             // 控制帧可能先于已入队的开始帧抵达，记录终态以免重新创建废弃会话。
+            // 发送端已主动放弃，无需答复。
             state.receipts.insert(&id, DeliveryStatus::Rejected);
-            let key = SessionKey::new(peer_id, id);
-            state.active_transfers.remove(&key);
-            state.active_images.remove(&key);
+            state.sessions.remove(&SessionKey::new(peer_id, id));
             crate::i18n::localized!(eprintln, "sync.remote_aborted");
         }
         WireMessage::ImageStart {
@@ -760,14 +771,17 @@ fn handle_incoming_event(
                 return Ok(());
             }
             let key = SessionKey::new(peer_id, id.clone());
-            if state.active_images.len() >= MAX_ACTIVE_IMAGES {
+            state.sessions.remove(&key);
+            let (count, active_size) = state
+                .sessions
+                .values()
+                .filter(|session| matches!(session.payload, IncomingPayload::Image(_)))
+                .fold((0, 0u64), |(count, total), session| {
+                    (count + 1, total + session.size)
+                });
+            if count >= MAX_ACTIVE_IMAGES {
                 crate::i18n::localized!(bail, "sync.too_many_image_transfers");
             }
-            let active_size = state
-                .active_images
-                .values()
-                .map(|active| active.size)
-                .sum::<u64>();
             if active_size.saturating_add(size) > MAX_ACTIVE_IMAGE_BYTES {
                 crate::i18n::localized!(bail, "sync.image_resource_limit");
             }
@@ -781,23 +795,28 @@ fn handle_incoming_event(
                 height = height,
                 size = format_bytes(size)
             );
-            state.active_images.insert(
+            state.sessions.insert(
                 key,
-                ActiveImage {
+                Session {
                     version,
                     last_activity: Instant::now(),
-                    image,
                     size,
+                    payload: IncomingPayload::Image(image),
                 },
             );
         }
         WireMessage::ImageChunk { id, offset, bytes } => {
             let key = SessionKey::new(peer_id, id);
-            let Some(active) = state.active_images.get_mut(&key) else {
+            let Some(Session {
+                last_activity,
+                payload: IncomingPayload::Image(image),
+                ..
+            }) = state.sessions.get_mut(&key)
+            else {
                 return Ok(());
             };
-            active.last_activity = Instant::now();
-            if let Err(error) = active.image.accept_chunk(offset, &bytes) {
+            *last_activity = Instant::now();
+            if let Err(error) = image.accept_chunk(offset, &bytes) {
                 return Err(
                     crate::i18n::localized!(anyhow, "sync.image_chunk_failed", error = error : {:#}),
                 );
@@ -805,20 +824,23 @@ fn handle_incoming_event(
         }
         WireMessage::ImageEnd { id, sha256 } => {
             let key = SessionKey::new(peer_id, id.clone());
-            let Some(active) = state.active_images.remove(&key) else {
+            let Some(Session {
+                version,
+                payload: IncomingPayload::Image(image),
+                ..
+            }) = state.sessions.remove(&key)
+            else {
                 crate::i18n::localized!(eprintln, "sync.image_transfer_missing", id = id);
                 return Ok(());
             };
-            let version = active.version;
-            let (fingerprint, image) = active.image.finish(sha256).map_err(|error| {
+            let (fingerprint, image) = image.finish(sha256).map_err(|error| {
                 crate::i18n::localized!(anyhow, "sync.image_completion_failed", error = error : {:#})
             })?;
             clipboard.set_image(image).map_err(|error| {
                 crate::i18n::localized!(anyhow, "sync.apply_image_failed", error = error : {:#})
             })?;
-            state.receipts.insert(&id, DeliveryStatus::Applied);
             mark_remote_applied(state, fingerprint, peer_id, version);
-            reply(hub, peer_id, &id, DeliveryStatus::Applied);
+            conclude(state, hub, peer_id, &id, DeliveryStatus::Applied);
             crate::i18n::localized!(eprintln, "sync.image_applied");
         }
         WireMessage::DeliveryResult { .. } => {}
@@ -842,13 +864,6 @@ fn mark_remote_applied(
         .retain(|_, delivery| matches!(delivery, PeerDelivery::Delivered));
     state.deliveries.insert(peer_id, PeerDelivery::Delivered);
     state.last_send_error = None;
-}
-
-fn cleanup_peer_sessions(state: &mut SyncState, peer_id: u64) {
-    state
-        .active_transfers
-        .retain(|key, _| key.peer_id != peer_id);
-    state.active_images.retain(|key, _| key.peer_id != peer_id);
 }
 
 fn cleanup_file_cache(clipboard: &mut Clipboard, state: &SyncState) {
@@ -875,28 +890,20 @@ fn protected_cache_paths(
     };
     protected.extend(
         state
-            .active_transfers
+            .sessions
             .values()
-            .map(|active| active.transfer.cache_directory().to_path_buf()),
+            .filter_map(|session| match &session.payload {
+                IncomingPayload::Files(transfer) => Some(transfer.cache_directory().to_path_buf()),
+                IncomingPayload::Image(_) => None,
+            }),
     );
     Ok(protected)
 }
 
 fn expire_sessions(state: &mut SyncState, hub: &PeerHub) {
     let now = Instant::now();
-    state.active_transfers.retain(|key, active| {
-        let keep = now.duration_since(active.last_activity) < SESSION_IDLE_TIMEOUT;
-        if !keep {
-            reply(hub, key.peer_id, &key.message_id, DeliveryStatus::Rejected);
-        }
-        keep
-    });
-    state.active_images.retain(|key, active| {
-        let keep = now.duration_since(active.last_activity) < SESSION_IDLE_TIMEOUT;
-        if !keep {
-            reply(hub, key.peer_id, &key.message_id, DeliveryStatus::Rejected);
-        }
-        keep
+    end_sessions(state, hub, DeliveryStatus::Rejected, |session| {
+        now.duration_since(session.last_activity) >= SESSION_IDLE_TIMEOUT
     });
 }
 
@@ -1197,8 +1204,7 @@ mod tests {
                 assert_eq!(state.version, initial_version);
                 assert_eq!(state.applied_version, Some(initial_version));
                 assert_eq!(state.last_fingerprint, Some(42));
-                assert!(state.active_transfers.is_empty());
-                assert!(state.active_images.is_empty());
+                assert!(state.sessions.is_empty());
                 assert!(state.receipts.statuses.is_empty());
                 assert!(state.receipts.order.is_empty());
             }
@@ -1303,18 +1309,18 @@ mod tests {
         .unwrap();
         transfer.accept_chunk(0, 0, b"partial").unwrap();
         let directory = transfer.cache_directory().to_owned();
-        state.active_transfers.insert(
+        state.sessions.insert(
             SessionKey::new(1, "old".into()),
-            ActiveTransfer {
+            Session {
                 version: old_version,
                 last_activity: Instant::now(),
                 size: 100,
-                transfer,
+                payload: IncomingPayload::Files(transfer),
             },
         );
         state.observe_fingerprint(2);
-        discard_obsolete_transfers(&mut state, &hub);
-        assert!(state.active_transfers.is_empty());
+        discard_obsolete_sessions(&mut state, &hub);
+        assert!(state.sessions.is_empty());
         assert!(!directory.exists());
         assert!(!accept_version(&mut state, &hub, 1, "late", old_version));
         assert_eq!(state.last_fingerprint, Some(2));
