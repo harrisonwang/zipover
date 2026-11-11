@@ -20,10 +20,15 @@ pub(crate) enum CapturedPayload {
 }
 
 #[derive(Default)]
-pub(crate) struct CaptureCache {
-    files: Option<(Vec<PathBuf>, Arc<CapturedFiles>)>,
-    next_file_validation: Option<Instant>,
-    image: Option<CachedImage>,
+pub(crate) enum CaptureCache {
+    #[default]
+    Empty,
+    Files {
+        paths: Vec<PathBuf>,
+        files: Arc<CapturedFiles>,
+        valid_until: Instant,
+    },
+    Image(CachedImage),
 }
 
 pub(crate) fn capture_payload(
@@ -33,27 +38,47 @@ pub(crate) fn capture_payload(
     let paths = match clipboard.get().file_list() {
         Ok(paths) => paths,
         Err(arboard::Error::ContentNotAvailable) => Vec::new(),
-        Err(error) => return Err(error).context(crate::i18n::tr("clipboard.read_files_failed")),
+        Err(error) => {
+            *cache = CaptureCache::Empty;
+            return Err(error).context(crate::i18n::tr("clipboard.read_files_failed"));
+        }
     };
     if !paths.is_empty() {
-        if let Some((cached_paths, files)) = &cache.files
+        if let CaptureCache::Files {
+            paths: cached_paths,
+            files,
+            valid_until,
+        } = &*cache
             && *cached_paths == paths
-            && cache
-                .next_file_validation
-                .is_some_and(|deadline| deadline > Instant::now())
+            && *valid_until > Instant::now()
         {
             return Ok(Some(CapturedPayload::Files(files.clone())));
         }
+        *cache = CaptureCache::Empty;
         let files = Arc::new(capture_files(&paths)?);
-        cache.files = Some((paths, files.clone()));
-        cache.next_file_validation = Some(Instant::now() + FILE_CACHE_VALIDATION_INTERVAL);
+        *cache = CaptureCache::Files {
+            paths,
+            files: files.clone(),
+            valid_until: Instant::now() + FILE_CACHE_VALIDATION_INTERVAL,
+        };
         return Ok(Some(CapturedPayload::Files(files)));
     }
-    cache.files = None;
-    cache.next_file_validation = None;
 
-    if let Some(image) = capture_image(clipboard, &mut cache.image)? {
-        return Ok(Some(CapturedPayload::Image(image)));
+    let cached_image = match &*cache {
+        CaptureCache::Image(image) => Some(image),
+        _ => None,
+    };
+    match capture_image(clipboard, cached_image) {
+        Ok(Some(cached)) => {
+            let image = cached.image.clone();
+            *cache = CaptureCache::Image(cached);
+            return Ok(Some(CapturedPayload::Image(image)));
+        }
+        Ok(None) => *cache = CaptureCache::Empty,
+        Err(error) => {
+            *cache = CaptureCache::Empty;
+            return Err(error);
+        }
     }
     match clipboard.get_text() {
         Ok(text) if !text.is_empty() => Ok(Some(CapturedPayload::Text(text))),

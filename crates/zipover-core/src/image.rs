@@ -20,9 +20,10 @@ pub(crate) struct CapturedImage {
     bytes: Arc<[u8]>,
 }
 
+#[derive(Clone)]
 pub(crate) struct CachedImage {
     raw_fingerprint: u64,
-    image: CapturedImage,
+    pub(crate) image: CapturedImage,
 }
 
 pub(crate) struct IncomingImage {
@@ -52,44 +53,36 @@ impl CapturedImage {
 
 pub(crate) fn capture_image(
     clipboard: &mut Clipboard,
-    cache: &mut Option<CachedImage>,
-) -> Result<Option<CapturedImage>> {
+    cached: Option<&CachedImage>,
+) -> Result<Option<CachedImage>> {
     let image = match clipboard.get_image() {
         Ok(image) => image,
-        Err(arboard::Error::ContentNotAvailable) => {
-            *cache = None;
-            return Ok(None);
-        }
-        Err(error) => {
-            *cache = None;
-            return Err(error).context(crate::i18n::tr("image.read_failed"));
-        }
+        Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+        Err(error) => return Err(error).context(crate::i18n::tr("image.read_failed")),
     };
 
     let width = u32::try_from(image.width).context(crate::i18n::tr("image.too_wide"))?;
     let height = u32::try_from(image.height).context(crate::i18n::tr("image.too_tall"))?;
     let raw_fingerprint = image_fingerprint(width, height, image.bytes.as_ref());
-    if let Some(cached) = cache
+    if let Some(cached) = cached
         && cached.raw_fingerprint == raw_fingerprint
     {
-        return Ok(Some(cached.image.clone()));
+        return Ok(Some(cached.clone()));
     }
 
     let bytes: Arc<[u8]> = encode_png(width, height, image.bytes.as_ref())?
         .into_boxed_slice()
         .into();
     let fingerprint = image_fingerprint(width, height, bytes.as_ref());
-    let captured = CapturedImage {
-        fingerprint,
-        width,
-        height,
-        bytes,
-    };
-    *cache = Some(CachedImage {
+    Ok(Some(CachedImage {
         raw_fingerprint,
-        image: captured.clone(),
-    });
-    Ok(Some(captured))
+        image: CapturedImage {
+            fingerprint,
+            width,
+            height,
+            bytes,
+        },
+    }))
 }
 
 pub(crate) fn send_image_transfer(
