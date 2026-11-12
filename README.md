@@ -19,7 +19,7 @@ Copy text, images, files, or folders on one computer and paste them on another. 
 
 ## Install
 
-Download **Zipover Desktop 1.3.6** from [zipover.app/download](https://zipover.app/download/). That page lists Mac Apple Silicon/Intel, Windows x64 and Linux x64 packages, installation instructions and current signing limitations. You can also install Desktop using the package-manager commands below. The CLI is available separately.
+Download **Zipover Desktop** from [zipover.app/download](https://zipover.app/download/). That page lists Mac Apple Silicon/Intel, Windows x64 and Linux x64 packages, installation instructions and current signing limitations. You can also install Desktop using the package-manager commands below. Desktop includes a 30-day free trial; the CLI is free, open source, and available separately.
 
 ### macOS
 
@@ -73,4 +73,4 @@ cargo build --locked --release --workspace
 cargo test --locked --workspace --all-targets
 ```
 
-[MIT License](LICENSE)
+[MIT License](LICENSE) for the CLI and core · [Commercial license](https://zipover.app/license/) for Zipover Desktop

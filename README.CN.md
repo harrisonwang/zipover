@@ -5,8 +5,8 @@
 <h1 align="center">Zipover</h1>
 
 <p align="center">
-  <strong>这边复制，那边粘贴。</strong><br>
-  让你的电脑共用一个剪贴板。
+  <strong>这台复制，那台粘贴。</strong><br>
+  你的电脑，共享一个剪贴板。
 </p>
 
 <p align="center">
@@ -19,7 +19,7 @@
 
 ## 安装
 
-从 [zipover.app/cn/download](https://zipover.app/cn/download/) 下载 **Zipover Desktop 1.3.6**。页面提供 Mac Apple Silicon / Intel、Windows x64、Linux x64 安装包及首次启动、签名限制说明。也可使用以下包管理器命令安装 Desktop；CLI 可按后文说明单独安装。
+从 [zipover.app/cn/download](https://zipover.app/cn/download/) 下载 **Zipover Desktop**。页面提供 Mac Apple Silicon / Intel、Windows x64、Linux x64 安装包及首次启动、签名限制说明。也可使用以下包管理器命令安装 Desktop。Desktop 提供 30 天免费试用；CLI 免费开源，可按后文说明单独安装。
 
 ### macOS
 
@@ -73,4 +73,4 @@ cargo build --locked --release --workspace
 cargo test --locked --workspace --all-targets
 ```
 
-[MIT 许可证](LICENSE)
+CLI 与 core 遵循 [MIT 许可证](LICENSE) · Zipover Desktop 适用[商业许可](https://zipover.app/cn/license/)
